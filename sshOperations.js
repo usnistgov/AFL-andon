@@ -277,6 +277,25 @@ class SSHOperations {
     return 'linux';
   }
 
+  // Get the home directory path for a host based on its OS
+  async getRemoteHomePath(host, username) {
+    // Find a server on this host to detect OS
+    const serverName = Object.keys(this.config).find(name =>
+      this.config[name].host === host
+    );
+    
+    if (!serverName) {
+      // Default to Linux path if we can't detect
+      log.warn(`Cannot detect OS for ${host}, defaulting to Linux home path`);
+      return `/home/${username}`;
+    }
+    
+    const remoteOs = await this.getRemoteOs(serverName);
+    const homePath = remoteOs === 'darwin' ? `/Users/${username}` : `/home/${username}`;
+    log.debug(`Home path for ${username}@${host} (${remoteOs}): ${homePath}`);
+    return homePath;
+  }
+
   async startServer(serverName) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
@@ -709,7 +728,8 @@ class SSHOperations {
       return { success: false, error: `No server for host ${host}` };
     }
     
-    const remotePath = `/home/${server.username}/.afl/config.json`;
+    const homePath = await this.getRemoteHomePath(host, server.username);
+    const remotePath = `${homePath}/.afl/config.json`;
     log.info(`Getting AFL config from ${host}: ${remotePath}`);
     
     const res = await this.readRemoteFile(host, remotePath);
@@ -733,7 +753,8 @@ class SSHOperations {
       return { success: false, error: `No server for host ${host}` };
     }
     
-    const remotePath = `/home/${server.username}/.afl/config.json`;
+    const homePath = await this.getRemoteHomePath(host, server.username);
+    const remotePath = `${homePath}/.afl/config.json`;
     log.info(`Saving AFL config to ${remotePath} on ${host}`);
     
     let existing = {};

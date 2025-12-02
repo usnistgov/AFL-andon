@@ -29,11 +29,16 @@ let selectedAflHost = null;
 function parseAflTimestamp(key) {
   try {
     const [datePart, timePart] = key.split(' ');
-    const [yy, dd, mm] = datePart.split('/').map(Number);
+    const [yearPart, dd, mm] = datePart.split('/').map(Number);
     const [hh, mi, secPart] = timePart.split(':');
     const ss = Number(secPart.split('.')[0]);
-    return new Date(2000 + yy, mm - 1, dd, Number(hh), Number(mi), ss).getTime();
-  } catch (_) {
+    // Handle both 2-digit (YY) and 4-digit (YYYY) year formats
+    const year = yearPart < 100 ? 2000 + yearPart : yearPart;
+    const timestamp = new Date(year, mm - 1, dd, Number(hh), Number(mi), ss).getTime();
+    log.debug(`Parsed timestamp "${key}" -> ${new Date(timestamp).toISOString()}`);
+    return timestamp;
+  } catch (e) {
+    log.warn(`Failed to parse timestamp "${key}": ${e.message}`);
     return 0;
   }
 }
@@ -157,14 +162,22 @@ async function loadAflConfig() {
     return;
   }
   const fullCfg = result.data || {};
+  const keys = Object.keys(fullCfg);
+  log.info(`AFL config has ${keys.length} entries: ${keys.join(', ')}`);
+  
   let latestKey = null;
-  Object.keys(fullCfg).forEach(k => {
-    if (!latestKey || parseAflTimestamp(k) > parseAflTimestamp(latestKey)) {
+  let latestTimestamp = 0;
+  keys.forEach(k => {
+    const ts = parseAflTimestamp(k);
+    log.debug(`Entry "${k}" parsed to timestamp ${ts} (${new Date(ts).toISOString()})`);
+    if (ts > latestTimestamp) {
+      latestTimestamp = ts;
       latestKey = k;
     }
   });
+  
   aflConfig = latestKey ? fullCfg[latestKey] : {};
-  log.debug(`AFL config loaded, latest key: ${latestKey || '(none)'}`);
+  log.info(`AFL config loaded, selected latest key: "${latestKey || '(none)'}" with timestamp ${latestTimestamp}`);
   renderAflConfigEditor();
 }
 
