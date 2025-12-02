@@ -3,6 +3,10 @@ const { ipcRenderer } = require('electron');
 const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const JSONEditor = require('jsoneditor');
+const { createLogger } = require('./logger');
+
+const log = createLogger('renderer');
+
 // Use the built-in fetch in recent Node versions. node-fetch remains as a
 // fallback for older environments but may throw if imported directly.
 let fetchFn;
@@ -13,6 +17,9 @@ try {
   // `require` will fail for ESM-only node-fetch; fall back to global
   fetchFn = global.fetch;
 }
+
+log.info('Renderer process starting');
+
 let config;
 let editingServer = null;
 let aflConfig = {};
@@ -39,42 +46,48 @@ let activeTab = null;
 let inactiveExpanded = false;
 
 async function joinServer(serverName) {
+  log.info(`Joining server: ${serverName}`);
   try {
     // Close existing connection if any
     if (currentServerName) {
+      log.debug(`Closing existing connection to ${currentServerName}`);
       await ipcRenderer.invoke('close-ssh-session', currentServerName);
       currentServerName = null;
     }
 
     // Reinitialize terminal
     if (terminal) {
+      log.debug('Disposing old terminal instance');
       terminal.dispose();
       terminal = null;
     }
     initializeTerminal();
 
+    log.debug(`Starting SSH session for ${serverName}`);
     const result = await ipcRenderer.invoke('start-ssh-session', serverName);
     if (result.success) {
+      log.info(`Successfully connected to ${serverName}`);
       showTerminalModal();
       currentServerName = serverName;
       terminal.clear();
       terminal.writeln(`Connected to ${serverName}`);
     } else {
-      console.error(`Failed to join server ${serverName}`);
+      log.error(`Failed to join server ${serverName}: ${result.error || 'Unknown error'}`);
       alert(`Failed to join server ${serverName}`);
     }
   } catch (error) {
-    console.error(`Error joining server ${serverName}:`, error);
+    log.error(`Error joining server ${serverName}:`, error.message);
     alert(`Error joining server ${serverName}: ${error.message}`);
   }
 }
 
 function initializeTerminal() {
   if (terminal) {
-    console.warn('Terminal already initialized, disposing old instance');
+    log.warn('Terminal already initialized, disposing old instance');
     terminal.dispose();
   }
 
+  log.debug('Creating new terminal instance');
   terminal = new Terminal({
     disableStdin: false
   });
@@ -99,10 +112,13 @@ function initializeTerminal() {
       terminal.write(data);
     }
   });
+  
+  log.debug('Terminal initialized');
 }
 
 
 function showTerminalModal() {
+  log.debug('Showing terminal modal');
   const modal = document.getElementById('terminal-modal');
   modal.style.display = 'block';
   if (!terminal) {
@@ -111,24 +127,32 @@ function showTerminalModal() {
 }
 
 function closeTerminalModal() {
+  log.debug('Closing terminal modal');
   const modal = document.getElementById('terminal-modal');
   modal.style.display = 'none';
   if (currentServerName) {
+    log.debug(`Closing SSH session for ${currentServerName}`);
     ipcRenderer.send('close-ssh-session', currentServerName);
     currentServerName = null;
   }
 }
 
 async function loadConfig() {
+  log.debug('Loading configuration');
   config = await ipcRenderer.invoke('get-config');
+  const serverCount = Object.keys(config || {}).length;
+  log.info(`Configuration loaded: ${serverCount} servers`);
 }
 
 async function loadAflConfig() {
-  if (!selectedAflHost) return;
-  console.log(`Loading AFL config from ${selectedAflHost}`);
+  if (!selectedAflHost) {
+    log.debug('No AFL host selected, skipping config load');
+    return;
+  }
+  log.info(`Loading AFL config from ${selectedAflHost}`);
   const result = await ipcRenderer.invoke('get-afl-config', selectedAflHost);
   if (!result.success) {
-    console.error('Failed to load AFL config:', result.error);
+    log.error(`Failed to load AFL config from ${selectedAflHost}:`, result.error);
     alert(`Failed to load config: ${result.error}`);
     return;
   }
@@ -140,6 +164,7 @@ async function loadAflConfig() {
     }
   });
   aflConfig = latestKey ? fullCfg[latestKey] : {};
+  log.debug(`AFL config loaded, latest key: ${latestKey || '(none)'}`);
   renderAflConfigEditor();
 }
 
@@ -147,6 +172,7 @@ function renderAflConfigEditor() {
   const container = document.getElementById('afl-config-editor');
   if (!container) return;
   if (!aflConfigEditor) {
+    log.debug('Creating AFL config editor');
     aflConfigEditor = new JSONEditor(container, {
       mode: 'tree',
       mainMenuBar: false,
@@ -158,17 +184,21 @@ function renderAflConfigEditor() {
 }
 
 async function saveAflConfig() {
-  if (!selectedAflHost) return;
+  if (!selectedAflHost) {
+    log.warn('No AFL host selected for saving');
+    return;
+  }
   if (aflConfigEditor) {
     aflConfig = aflConfigEditor.get();
   }
-  console.log(`Saving AFL config to ${selectedAflHost}`);
+  log.info(`Saving AFL config to ${selectedAflHost}`);
   const res = await ipcRenderer.invoke('save-afl-config', selectedAflHost, aflConfig);
   if (res && res.success) {
+    log.info('AFL config saved successfully');
     alert('Settings saved');
   } else {
     const errMsg = res && res.error ? res.error : 'unknown error';
-    console.error('Failed to save AFL config:', errMsg);
+    log.error(`Failed to save AFL config:`, errMsg);
     alert(`Failed to save settings: ${errMsg}`);
   }
   await loadAflConfig();
@@ -179,6 +209,7 @@ function populateAflHostSelect() {
   if (!select) return;
   select.innerHTML = '';
   const hosts = Array.from(new Set(Object.values(config || {}).map(c => c.host)));
+  log.debug(`Populating AFL host select with ${hosts.length} hosts`);
   hosts.forEach(h => {
     const opt = document.createElement('option');
     opt.value = h;
@@ -188,9 +219,11 @@ function populateAflHostSelect() {
   if (hosts.length && !selectedAflHost) {
     selectedAflHost = hosts[0];
     select.value = selectedAflHost;
+    log.debug(`Selected default AFL host: ${selectedAflHost}`);
   }
   select.onchange = async () => {
     selectedAflHost = select.value;
+    log.debug(`AFL host changed to ${selectedAflHost}`);
     await loadAflConfig();
   };
 }
@@ -198,7 +231,10 @@ function populateAflHostSelect() {
 
 async function fetchQueueState(serverName) {
   const serverConfig = config[serverName];
-  if (!serverConfig) return { ok: false, state: null };
+  if (!serverConfig) {
+    log.warn(`No config for server ${serverName}`);
+    return { ok: false, state: null };
+  }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
   const controller = new AbortController();
@@ -206,6 +242,7 @@ async function fetchQueueState(serverName) {
   try {
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
+      log.debug(`${serverName}: HTTP ${response.status} from ${url}`);
       return { ok: false, state: null };
     }
     if (serverConfig.device) {
@@ -217,9 +254,11 @@ async function fetchQueueState(serverName) {
     } catch (_) {
       state = null;
     }
+    log.debug(`${serverName}: Queue state = ${state || '(none)'}`);
     return { ok: true, state };
   } catch (err) {
     // Treat network errors (e.g., connection refused) as unreachable
+    log.debug(`${serverName}: Unreachable at ${url}`);
     return { ok: false, state: null };
   } finally {
     clearTimeout(timer);
@@ -235,7 +274,7 @@ async function updateServerStatus(serverName) {
 
     updateServerStatusUI(serverName, result, queueResult);
   } catch (error) {
-    console.error(`Error getting status for ${serverName}:`, error);
+    log.error(`Error getting status for ${serverName}:`, error.message);
   }
 }
 
@@ -292,6 +331,7 @@ async function batchUpdateServerStatuses() {
 
         if (!batchResult.success) {
           // If SSH is down for this host, update all servers on this host
+          log.warn(`SSH down for host ${host}, marking all servers as down`);
           servers.forEach(serverName => {
             updateServerStatusUI(serverName, { sshDown: true }, false);
           });
@@ -305,7 +345,7 @@ async function batchUpdateServerStatuses() {
           servers.map(async serverName => {
             const serverConfig = config[serverName];
             if (!serverConfig) {
-              console.warn(`No config for server ${serverName}`);
+              log.warn(`No config for server ${serverName}`);
               return;
             }
             const screenStatus = {
@@ -319,7 +359,7 @@ async function batchUpdateServerStatuses() {
             try {
               queueResult = await fetchQueueState(serverName);
             } catch (err) {
-              console.error(`Error fetching queue state for ${serverName}:`, err);
+              log.error(`Error fetching queue state for ${serverName}:`, err.message);
               queueResult = { ok: false, state: null };
             }
 
@@ -330,31 +370,34 @@ async function batchUpdateServerStatuses() {
       })
     );
   } catch (error) {
-    console.error('Error in batch status update:', error);
+    log.error('Error in batch status update:', error.message);
   }
 }
 
 async function controlServer(serverName, action) {
+  log.info(`Controlling server ${serverName}: ${action}`);
   try {
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
     if (result.success) {
-      console.log(`${action} successful for ${serverName}`);
+      log.info(`${action} successful for ${serverName}`);
     } else if (result.sshDown) {
-      console.log(`SSH is down for ${serverName}`);
+      log.warn(`SSH is down for ${serverName}`);
     } else {
-      console.error(`${action} failed for ${serverName}`);
+      log.error(`${action} failed for ${serverName}:`, result.error || 'Unknown error');
     }
     updateServerStatus(serverName);
   } catch (error) {
-    console.error(`Error during ${action} for ${serverName}:`, error);
+    log.error(`Error during ${action} for ${serverName}:`, error.message);
   }
 }
 
 
 async function viewServerLog(serverName) {
+  log.info(`Viewing log for ${serverName}`);
   try {
     const result = await ipcRenderer.invoke('get-server-log', serverName, 200); // Request 200 lines
     if (result.success) {
+      log.debug(`Retrieved log for ${serverName}: ${result.output?.length || 0} bytes`);
       const logModal = document.getElementById('log-modal');
       const logContent = document.getElementById('log-content');
       const logTitle = document.getElementById('log-title');
@@ -368,24 +411,26 @@ async function viewServerLog(serverName) {
       // Scroll to the bottom
       logContent.scrollTop = logContent.scrollHeight;
     } else if (result.sshDown) {
-      console.log(`SSH is down for ${serverName}`);
+      log.warn(`SSH is down for ${serverName}`);
       alert(`Unable to get log: SSH is down for ${serverName}`);
     } else {
-      console.error(`Failed to get log for ${serverName}`);
+      log.error(`Failed to get log for ${serverName}`);
       alert(`Failed to get log for ${serverName}`);
     }
   } catch (error) {
-    console.error(`Error getting log for ${serverName}:`, error);
+    log.error(`Error getting log for ${serverName}:`, error.message);
   }
 }
 
 // Function to close the log modal
 function closeLogModal() {
+  log.debug('Closing log modal');
   const logModal = document.getElementById('log-modal');
   logModal.style.display = 'none';
 }
 
 function createServerTabs() {
+  log.debug('Creating server tabs');
   const tabList = document.getElementById('tab-list');
   tabList.innerHTML = '';
   const andonLi = document.createElement('li');
@@ -397,9 +442,12 @@ function createServerTabs() {
   andonLi.appendChild(andonIcon);
   andonLi.onclick = openAndonPanel;
   tabList.appendChild(andonLi);
+  
+  let activeCount = 0;
   Object.keys(config).forEach(serverName => {
     const serverConfig = config[serverName];
     if (!serverConfig.active) return; // skip disabled servers
+    activeCount++;
     const li = document.createElement('li');
     li.className = 'tab-item';
     li.dataset.server = serverName;
@@ -411,6 +459,7 @@ function createServerTabs() {
     li.onclick = () => openServerWebview(serverName);
     tabList.appendChild(li);
   });
+  
   const settingsLi = document.createElement('li');
   settingsLi.className = 'tab-item';
   settingsLi.id = 'settings-tab';
@@ -421,6 +470,8 @@ function createServerTabs() {
   settingsLi.appendChild(settingsIcon);
   settingsLi.onclick = openSettingsPanel;
   tabList.appendChild(settingsLi);
+  
+  log.debug(`Created tabs for ${activeCount} active servers`);
 }
 
 function updateTabStatus(serverName, queueResult) {
@@ -453,6 +504,7 @@ function updateTabStatus(serverName, queueResult) {
 
 function setActiveTab(name) {
   activeTab = name;
+  log.debug(`Setting active tab: ${name}`);
   document.querySelectorAll('.tab-item').forEach(item => item.classList.remove('selected'));
   const tab = document.querySelector(`.tab-item[data-server="${name}"]`);
   if (tab) tab.classList.add('selected');
@@ -475,6 +527,7 @@ function setActiveTab(name) {
 }
 
 function openAndonPanel() {
+  log.debug('Opening Andon panel');
   const webview = document.getElementById('server-webview');
   webview.src = '';
   setActiveTab('andon');
@@ -485,22 +538,27 @@ function openServerWebview(serverName) {
     `.tab-item[data-server="${serverName}"] .tab-icon`
   );
   if (tabIcon && tabIcon.classList.contains('status-red')) {
+    log.debug(`Server ${serverName} is down, not opening webview`);
     return; // server down - don't change tabs
   }
+  log.info(`Opening webview for server: ${serverName}`);
   const serverConfig = config[serverName];
   setActiveTab(serverName);
   const webview = document.getElementById('server-webview');
   const url = serverConfig.webview_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/`;
+  log.debug(`Loading URL: ${url}`);
   webview.src = url;
   activeTab = serverName;
 }
 
 function closeServerWebview() {
+  log.debug('Closing server webview');
   openAndonPanel();
 }
 
 async function openSettingsPanel() {
+  log.debug('Opening settings panel');
   populateAflHostSelect();
   await loadAflConfig();
   setActiveTab('settings');
@@ -588,6 +646,7 @@ function createServerControls(serverName) {
 
 
 function openServerModal(serverName = null) {
+  log.debug(`Opening server modal for: ${serverName || 'new server'}`);
   const modal = document.getElementById('server-modal');
   const modalTitle = document.getElementById('modal-title');
   const form = document.getElementById('server-form');
@@ -606,7 +665,9 @@ function openServerModal(serverName = null) {
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
     form.elements['server-shell'].value = server.shell || 'bash';
+    form.elements['server-env-type'].value = server.env_type || (server.conda_env ? 'conda' : 'pip');
     form.elements['server-conda-env'].value = server.conda_env || '';
+    form.elements['server-virtualenv-path'].value = server.virtualenv_path || '';
     form.elements['server-device'].checked = !!server.device;
     form.elements['server-status-url'].value = server.status_url || '';
     form.elements['server-webview-url'].value = server.webview_url || '';
@@ -622,9 +683,11 @@ function openServerModal(serverName = null) {
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
     form.elements['server-active'].checked = true;
+    form.elements['server-env-type'].value = 'conda';
   }
 
   updateServerTypeFields();
+  updateEnvTypeFields();
   modal.style.display = 'block';
 }
 
@@ -634,10 +697,18 @@ function updateServerTypeFields() {
   document.getElementById('module-group').style.display = serverType === 'module' ? 'block' : 'none';
 }
 
+function updateEnvTypeFields() {
+  const envType = document.getElementById('server-env-type').value;
+  document.getElementById('conda-group').style.display = envType === 'conda' ? 'block' : 'none';
+  document.getElementById('virtualenv-group').style.display = envType === 'pip' ? 'block' : 'none';
+}
+
 async function handleServerFormSubmit(event) {
   event.preventDefault();
   const form = event.target;
   const serverName = form.elements['server-name'].value;
+  log.info(`Submitting server form for: ${serverName}`);
+  
   const serverConfig = {
     host: form.elements['server-host'].value,
     username: form.elements['server-username'].value,
@@ -655,9 +726,19 @@ async function handleServerFormSubmit(event) {
     serverConfig.server_module = form.elements['server-module'].value;
   }
 
-  const condaEnv = form.elements['server-conda-env'].value;
-  if (condaEnv) {
-    serverConfig.conda_env = condaEnv;
+  const envType = form.elements['server-env-type'].value;
+  serverConfig.env_type = envType;
+
+  if (envType === 'conda') {
+    const condaEnv = form.elements['server-conda-env'].value;
+    if (condaEnv) {
+      serverConfig.conda_env = condaEnv;
+    }
+  } else if (envType === 'pip') {
+    const venvPath = form.elements['server-virtualenv-path'].value;
+    if (venvPath) {
+      serverConfig.virtualenv_path = venvPath;
+    }
   }
 
   const statusUrl = form.elements['server-status-url'].value;
@@ -677,19 +758,23 @@ async function handleServerFormSubmit(event) {
 
   closeServerModal();
 }
+
 function closeServerModal() {
+  log.debug('Closing server modal');
   const modal = document.getElementById('server-modal');
   modal.style.display = 'none';
   editingServer = null;
 }
 
 async function addServer(serverName, serverConfig) {
+  log.info(`Adding new server: ${serverName}`);
   await ipcRenderer.invoke('add-server', { serverName, serverConfig });
   await loadConfig();
   renderServers();
 }
 
  async function updateServer(serverName, serverConfig) {
+  log.info(`Updating server: ${serverName}`);
   let tabElement = document.querySelector(`.tab-item[data-server="${activeTab}"]`);
   if (!tabElement) {
     activeTab = 'andon';
@@ -701,17 +786,21 @@ async function addServer(serverName, serverConfig) {
 }
 
 async function removeServer(serverName) {
+  log.info(`Removing server: ${serverName}`);
   await ipcRenderer.invoke('remove-server', serverName);
   await loadConfig();
   renderServers();
 }
+
 async function toggleServerActive(serverName) {
+  log.info(`Toggling active state for: ${serverName}`);
   await ipcRenderer.invoke('toggle-server-active', serverName);
   await loadConfig();
   renderServers();
 }
 
 function renderServers() {
+  log.debug('Rendering servers');
   const appContainer = document.getElementById('app');
 
   // Clear existing content
@@ -728,8 +817,10 @@ function renderServers() {
   });
 
   // Render active servers
+  let activeCount = 0;
   sortedServers.forEach(serverName => {
     if (config[serverName].active) {
+      activeCount++;
       const serverControls = createServerControls(serverName);
       appContainer.appendChild(serverControls);
     }
@@ -754,6 +845,8 @@ function renderServers() {
     inactiveContent.appendChild(serverControls);
   });
 
+  log.info(`Rendered ${activeCount} active servers, ${inactiveServers.length} inactive`);
+
   // Update all server statuses
   sortedServers.forEach(updateServerStatus);
 }
@@ -763,6 +856,7 @@ function toggleInactiveServers() {
   const content = document.getElementById('inactive-servers-content');
   const arrow = document.querySelector('#inactive-servers-header .arrow');
   inactiveExpanded = !inactiveExpanded;
+  log.debug(`Inactive servers section ${inactiveExpanded ? 'expanded' : 'collapsed'}`);
   if (inactiveExpanded) {
     content.style.display = 'grid';
     arrow.textContent = '▼';
@@ -771,48 +865,60 @@ function toggleInactiveServers() {
     arrow.textContent = '▶';
   }
 }
+
 async function importConfig() {
+  log.info('Importing configuration');
   try {
     const result = await ipcRenderer.invoke('import-config');
     if (result.success) {
+      log.info('Configuration imported successfully');
       alert(result.message);
       await loadConfig();
       renderServers();
     } else {
+      log.warn('Configuration import failed:', result.message || result.error);
       alert(result.message || result.error);
     }
   } catch (error) {
-    console.error('Error importing config:', error);
+    log.error('Error importing config:', error.message);
     alert('Failed to import config file.');
   }
 }
 
 async function importSSHKey() {
+  log.info('Importing SSH key');
   try {
     const result = await ipcRenderer.invoke('import-ssh-key');
     if (result.success) {
+      log.info('SSH key imported successfully');
       alert(result.message);
     } else {
+      log.warn('SSH key import failed:', result.message || result.error);
       alert(result.message || result.error);
     }
   } catch (error) {
-    console.error('Error importing SSH key:', error);
+    log.error('Error importing SSH key:', error.message);
     alert('Failed to import SSH key.');
   }
 }
+
 async function loadPaths() {
+  log.debug('Loading paths');
   const paths = await ipcRenderer.invoke('get-paths');
   document.getElementById('config-path').textContent = paths.configPath;
   document.getElementById('ssh-key-path').textContent = paths.sshKeyPath;
+  log.debug(`Config path: ${paths.configPath}, SSH key path: ${paths.sshKeyPath}`);
 }
 
 async function setConfigPath() {
+  log.debug('Opening config path dialog');
   const result = await ipcRenderer.invoke('show-open-dialog', {
     properties: ['openFile'],
     filters: [{ name: 'JSON', extensions: ['json'] }]
   });
   if (!result.canceled) {
     const newPath = result.filePaths[0];
+    log.info(`Setting config path to: ${newPath}`);
     await ipcRenderer.invoke('set-config-path', newPath);
     loadPaths();
     renderServers();  // Reload the server list with the new configuration
@@ -820,20 +926,25 @@ async function setConfigPath() {
 }
 
 async function saveConfig() {
+  log.info('Saving configuration');
   const result = await ipcRenderer.invoke('save-config');
   if (result.success) {
+    log.info('Configuration saved successfully');
     alert('Configuration saved successfully');
   } else {
+    log.error('Failed to save configuration:', result.error);
     alert('Failed to save configuration: ' + result.error);
   }
 }
 
 async function setSshKeyPath() {
+  log.debug('Opening SSH key path dialog');
   const result = await ipcRenderer.invoke('show-open-dialog', {
     properties: ['openFile']
   });
   if (!result.canceled) {
     const newPath = result.filePaths[0];
+    log.info(`Setting SSH key path to: ${newPath}`);
     await ipcRenderer.invoke('set-ssh-key-path', newPath);
     loadPaths();
   }
@@ -841,6 +952,8 @@ async function setSshKeyPath() {
 
 // Wait for the DOM to be fully loaded before creating UI elements
 document.addEventListener('DOMContentLoaded', async () => {
+  log.info('DOM content loaded, initializing UI');
+  
   await loadPaths();  // Load paths first
   await loadConfig();
   renderServers();
@@ -852,6 +965,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // document.getElementById('import-config-btn').addEventListener('click', importConfig);
   // document.getElementById('import-ssh-key-btn').addEventListener('click', importSSHKey);
   document.getElementById('server-type').addEventListener('change', updateServerTypeFields);
+  document.getElementById('server-env-type').addEventListener('change', updateEnvTypeFields);
   document.getElementById('set-config-path-btn').addEventListener('click', setConfigPath);
   document.getElementById('save-config-btn').addEventListener('click', saveConfig);
   document.getElementById('set-ssh-key-path-btn').addEventListener('click', setSshKeyPath);
@@ -896,6 +1010,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   
   let statusJobRunning = false;
 
+  log.info('Starting status update interval (500ms)');
   setInterval(async () => {
     if (statusJobRunning || !config) return;
     statusJobRunning = true;
@@ -905,4 +1020,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       statusJobRunning = false;
     }
   }, 500);   // 500 ms interval
+  
+  log.info('UI initialization complete');
 });

@@ -610,8 +610,19 @@
                     <input type="text" id="server-shell" value="bash">
                 </div>
                 <div class="form-group">
-                    <label for="server-conda-env">Conda Environment:</label>
+                    <label for="server-env-type">Environment Type:</label>
+                    <select id="server-env-type">
+                        <option value="conda">Conda</option>
+                        <option value="pip">Virtualenv (pip)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="conda-group">
+                    <label for="server-conda-env">Conda Environment Name:</label>
                     <input type="text" id="server-conda-env">
+                </div>
+                <div class="form-group" id="virtualenv-group" style="display: none;">
+                    <label for="server-virtualenv-path">Virtualenv Path:</label>
+                    <input type="text" id="server-virtualenv-path" placeholder="/path/to/venv">
                 </div>
                 <div class="form-group">
                     <label>

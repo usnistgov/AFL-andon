@@ -1,15 +1,21 @@
 const { Client } = require('ssh2');
 const fs = require('fs').promises;
 const path = require('path');
+const os = require('os');
+const { createLogger } = require('./logger');
 
-const DEBUG_SSH = ['1', 'true', 'yes'].includes(
-  (process.env.DEBUG_SSH || '').toLowerCase()
-);
-const debugLog = (...args) => {
-  if (DEBUG_SSH) {
-    console.log('[SSH DEBUG]', ...args);
-  }
-};
+const log = createLogger('ssh');
+
+// Common SSH key filenames in order of preference (modern/secure first)
+// Based on OpenSSH default identity file search order
+const SSH_KEY_CANDIDATES = [
+  'id_ed25519',      // Ed25519 - modern, recommended
+  'id_ecdsa',        // ECDSA
+  'id_ecdsa_sk',     // ECDSA with FIDO/U2F security key
+  'id_ed25519_sk',   // Ed25519 with FIDO/U2F security key
+  'id_rsa',          // RSA - traditional, widely supported
+  'id_dsa',          // DSA - deprecated but may still exist
+];
 
 class SSHOperations {
   constructor(configPath, sshKeyPath) {
@@ -17,72 +23,135 @@ class SSHOperations {
     this.sshKeyPath = sshKeyPath;
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
+    this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
+    log.debug(`SSHOperations created with configPath=${configPath}, sshKeyPath=${sshKeyPath}`);
   }
 
   async initialize() {
+    log.info('Initializing SSHOperations');
     await this.loadConfig();
     await this.loadSSHKey();
+    log.info('SSHOperations initialization complete');
   }
 
   async loadConfig() {
+    log.debug(`Loading config from ${this.configPath}`);
     try {
       const configData = await fs.readFile(this.configPath, 'utf8');
       this.config = JSON.parse(configData);
+      const serverCount = Object.keys(this.config).length;
+      log.info(`Loaded config with ${serverCount} servers from ${this.configPath}`);
+      
       // Set default values if not specified
       Object.keys(this.config).forEach(serverName => {
         const server = this.config[serverName];
-        if (!server.httpPort) server.httpPort = 5000;
-        if (!server.shell) server.shell = 'bash';
-        if (!('active' in server)) server.active = true;
-        if (!('device' in server)) server.device = false;
+        if (!server.httpPort) {
+          server.httpPort = 5000;
+          log.debug(`${serverName}: Using default httpPort 5000`);
+        }
+        if (!server.shell) {
+          server.shell = 'bash';
+          log.debug(`${serverName}: Using default shell 'bash'`);
+        }
+        if (!('active' in server)) {
+          server.active = true;
+        }
+        if (!('device' in server)) {
+          server.device = false;
+        }
         if (!server.username) {
-          console.warn(`Username not specified for server ${serverName}. Using current user.`);
-          server.username = require('os').userInfo().username;
+          log.warn(`${serverName}: Username not specified, using current user`);
+          server.username = os.userInfo().username;
         }
       });
     } catch (error) {
-      console.error('Error loading config:', error);
+      log.error(`Failed to load config from ${this.configPath}:`, error.message);
+      if (error.code === 'ENOENT') {
+        log.warn('Config file does not exist - starting with empty config');
+        this.config = {};
+      }
     }
   }
+
   async saveConfig() {
+    log.debug(`Saving config to ${this.configPath}`);
     try {
       await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2));
+      log.info(`Config saved successfully to ${this.configPath}`);
     } catch (error) {
-      console.error('Error saving config:', error);
+      log.error(`Failed to save config to ${this.configPath}:`, error.message);
       throw error;
     }
   }
 
   async loadSSHKey() {
-    try {
-      this.sshKey = await fs.readFile(this.sshKeyPath);
-    } catch (error) {
-      console.error('Error loading SSH key:', error);
+    log.debug('Loading SSH key');
+    
+    // First, try the explicitly configured path
+    if (this.sshKeyPath) {
+      try {
+        this.sshKey = await fs.readFile(this.sshKeyPath);
+        log.info(`Loaded SSH key from: ${this.sshKeyPath}`);
+        return;
+      } catch (error) {
+        log.debug(`Could not load SSH key from ${this.sshKeyPath}: ${error.message}`);
+      }
     }
+
+    // Fall back to searching common key locations
+    const sshDir = path.join(os.homedir(), '.ssh');
+    log.debug(`Searching for SSH keys in ${sshDir}`);
+    
+    for (const keyName of SSH_KEY_CANDIDATES) {
+      const keyPath = path.join(sshDir, keyName);
+      try {
+        this.sshKey = await fs.readFile(keyPath);
+        this.sshKeyPath = keyPath;
+        log.info(`Loaded SSH key from: ${keyPath}`);
+        return;
+      } catch (error) {
+        log.debug(`SSH key not found at ${keyPath}`);
+      }
+    }
+
+    const triedPaths = [this.sshKeyPath, ...SSH_KEY_CANDIDATES.map(k => path.join(sshDir, k))].filter(Boolean);
+    log.error(`No valid SSH key found. Tried: ${triedPaths.join(', ')}`);
   }
 
   setConfigPath(newPath) {
+    log.debug(`Setting config path to ${newPath}`);
     this.configPath = newPath;
   }
 
   setSshKeyPath(newPath) {
+    log.debug(`Setting SSH key path to ${newPath}`);
     this.sshKeyPath = newPath;
   }
+
   addServer(serverName, serverConfig) {
+    log.info(`Adding server: ${serverName}`);
+    log.debug(`Server config:`, serverConfig);
     this.config[serverName] = serverConfig;
   }
 
   removeServer(serverName) {
+    log.info(`Removing server: ${serverName}`);
     delete this.config[serverName];
   }
 
   updateServer(serverName, serverConfig) {
+    log.info(`Updating server: ${serverName}`);
+    log.debug(`New config:`, serverConfig);
     this.config[serverName] = { ...this.config[serverName], ...serverConfig };
   }
 
   toggleServerActive(serverName) {
     if (this.config[serverName]) {
-      this.config[serverName].active = !this.config[serverName].active;
+      const newState = !this.config[serverName].active;
+      this.config[serverName].active = newState;
+      log.info(`Server ${serverName} active state changed to ${newState}`);
+    } else {
+      log.warn(`Cannot toggle active state: server ${serverName} not found`);
     }
   }
 
@@ -90,11 +159,18 @@ class SSHOperations {
     return new Promise((resolve) => {
       const serverConfig = this.config[serverName];
       if (!serverConfig) {
+        log.error(`No config found for server: ${serverName}`);
         resolve({ success: false, sshDown: true });
         return;
       }
 
-      debugLog(`${serverName} -> ${serverConfig.host}: ${command}`);
+      if (!this.sshKey) {
+        log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
+        resolve({ success: false, sshDown: true, error: 'No SSH key loaded' });
+        return;
+      }
+
+      log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
 
       const conn = new Client();
       let timer;
@@ -107,11 +183,11 @@ class SSHOperations {
       };
 
       conn.on('ready', () => {
-        debugLog(`${serverName}: connection ready`);
+        log.debug(`${serverName}: SSH connection ready`);
         cleanup();
-        debugLog(`${serverName}: executing \"${command}\"`);
         conn.exec(command, (err, stream) => {
           if (err) {
+            log.error(`${serverName}: Command execution failed:`, err.message);
             conn.end();
             if (!settled) {
               settled = true;
@@ -123,29 +199,37 @@ class SSHOperations {
           let output = '';
           stream.on('close', (code, signal) => {
             conn.end();
-            debugLog(`${serverName}: command finished with code ${code}`);
+            log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
+            // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
+            const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
+            if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+              log.warn(`${serverName}: Command exited with non-zero code ${code}`);
+            }
             if (!settled) {
               settled = true;
               resolve({ success: true, output, code, signal });
             }
-            debugLog(`${serverName}: output length ${output.length}`);
+            log.debug(`${serverName}: Output length: ${output.length} bytes`);
           }).on('data', (data) => {
             output += data;
           }).stderr.on('data', (data) => {
             output += data;
+            log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
           });
         });
       }).on('error', (err) => {
         cleanup();
-        debugLog(`${serverName}: connection error`, err.message);
-        console.error(`SSH connection error for ${serverName}:`, err);
+        log.error(`${serverName}: SSH connection error:`, err.message);
+        if (err.level) {
+          log.debug(`${serverName}: Error level: ${err.level}`);
+        }
         if (!settled) {
           settled = true;
           resolve({ success: false, sshDown: true });
         }
       });
 
-      debugLog(`${serverName}: connecting to ${serverConfig.host}`);
+      log.debug(`${serverName}: Connecting to ${serverConfig.host}:22 as ${serverConfig.username}`);
       conn.connect({
         host: serverConfig.host,
         port: 22,
@@ -155,8 +239,7 @@ class SSHOperations {
 
       if (timeout > 0) {
         timer = setTimeout(() => {
-          console.warn(`SSH connection timed out for ${serverName}`);
-          debugLog(`${serverName}: timeout after ${timeout}ms`);
+          log.warn(`${serverName}: SSH connection timed out after ${timeout}ms`);
           conn.destroy();
           cleanup();
           if (!settled) {
@@ -168,44 +251,198 @@ class SSHOperations {
     });
   }
 
-  async startServer(serverName) {
+  // Detect remote OS (returns 'darwin' for macOS, 'linux' for Linux, etc.)
+  async getRemoteOs(serverName) {
     const serverConfig = this.config[serverName];
+    if (!serverConfig) return null;
+    
+    const host = serverConfig.host;
+    
+    // Check cache first
+    if (this.hostOsCache[host]) {
+      log.debug(`${serverName}: Using cached OS for ${host}: ${this.hostOsCache[host]}`);
+      return this.hostOsCache[host];
+    }
+    
+    // Detect OS using uname
+    const result = await this.executeCommand(serverName, 'uname -s', 5000);
+    if (result.success && result.output) {
+      const osName = result.output.trim().toLowerCase();
+      this.hostOsCache[host] = osName;
+      log.info(`${serverName}: Detected remote OS for ${host}: ${osName}`);
+      return osName;
+    }
+    
+    log.warn(`${serverName}: Could not detect remote OS, assuming linux`);
+    return 'linux';
+  }
+
+  async startServer(serverName) {
+    log.info(`Starting server: ${serverName}`);
+    const serverConfig = this.config[serverName];
+    
+    if (!serverConfig) {
+      log.error(`Cannot start server: ${serverName} not found in config`);
+      return { success: false, error: 'Server not found' };
+    }
+    
+    // Detect remote OS to use appropriate screen options
+    const remoteOs = await this.getRemoteOs(serverName);
+    const isMacOs = remoteOs === 'darwin';
+    log.debug(`${serverName}: Remote OS is ${remoteOs}, isMacOs=${isMacOs}`);
+    
     const screenLogPath = path.join('.afl', `${serverConfig.screen_name}.screenlog`);
     let startCommand;
 
+    // Build screen logging options based on OS
+    // macOS screen doesn't support -Logfile option, only -L (logs to screenlog.0 in cwd)
+    // Linux GNU screen supports -L -Logfile <path>
+    let screenLogOpts;
+    if (isMacOs) {
+      // On macOS, we can't specify logfile location with screen
+      // Instead, we'll redirect output within the command
+      screenLogOpts = '';
+      log.debug(`${serverName}: Using macOS-compatible screen options (no -Logfile)`);
+    } else {
+      screenLogOpts = `-L -Logfile $\{HOME}/${screenLogPath}`;
+      log.debug(`${serverName}: Using Linux screen options with -Logfile`);
+    }
+
     if (serverConfig.server_module) {
       let command = `python -m ${serverConfig.server_module}`;
-      if (serverConfig.conda_env) {
+      log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
+      
+      // Handle environment activation based on env_type
+      if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
+        log.debug(`${serverName}: Activating virtualenv at ${serverConfig.virtualenv_path}`);
+        command = `source ${serverConfig.virtualenv_path}/bin/activate;${command}`;
+      } else if (serverConfig.conda_env) {
+        log.debug(`${serverName}: Activating conda env: ${serverConfig.conda_env}`);
         command = `conda activate ${serverConfig.conda_env};${command}`;
       }
-      startCommand = `screen -d -m -L -Logfile $\{HOME}/${screenLogPath} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci "${command}"`;
+      
+      // On macOS, redirect output to log file since screen can't do it
+      if (isMacOs) {
+        command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
+      }
+      
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci "${command}"`;
     } else if (serverConfig.server_script) {
-      startCommand = `screen -d -m -L -Logfile $\{HOME}/${screenLogPath} -S ${serverConfig.screen_name} ${serverConfig.server_script}`;
+      log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
+      if (isMacOs) {
+        // Wrap script to redirect output on macOS
+        startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -c "${serverConfig.server_script} >> $\{HOME}/${screenLogPath} 2>&1"`;
+      } else {
+        startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.server_script}`;
+      }
     } else {
+      log.error(`${serverName}: Neither server_module nor server_script specified`);
       return { success: false, error: 'Neither server_module nor server_script specified in config' };
     }
 
-    return this.executeCommand(serverName, startCommand);
+    log.info(`${serverName}: Executing start command`);
+    log.debug(`${serverName}: Command: ${startCommand}`);
+    const result = await this.executeCommand(serverName, startCommand);
+    
+    if (!result.success) {
+      log.error(`${serverName}: Failed to start server - SSH connection failed`);
+      return result;
+    }
+    
+    // Log the command output for debugging
+    if (result.output && result.output.trim()) {
+      log.debug(`${serverName}: Command output:\n${result.output}`);
+    }
+    
+    // Check the exit code - screen -d -m should return 0 on success
+    if (result.code !== 0 && result.code !== null) {
+      log.error(`${serverName}: Start command failed with exit code ${result.code}`);
+      if (result.output && result.output.trim()) {
+        log.error(`${serverName}: Command output:\n${result.output}`);
+      }
+      return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
+    }
+    
+    log.info(`${serverName}: Server started successfully`);
+    return result;
   }
 
   async stopServer(serverName) {
+    log.info(`Stopping server: ${serverName}`);
     const serverConfig = this.config[serverName];
-    const stopCommand = `screen -X -S ${serverConfig.screen_name} quit`;
-    return this.executeCommand(serverName, stopCommand);
+    
+    if (!serverConfig) {
+      log.error(`Cannot stop server: ${serverName} not found in config`);
+      return { success: false, error: 'Server not found' };
+    }
+    
+    // Build a more robust stop command that:
+    // 1. Sends Ctrl+C to the screen session to gracefully stop the process
+    // 2. Waits briefly for graceful shutdown
+    // 3. Kills any remaining python processes running the server module
+    // 4. Quits the screen session
+    
+    let stopCommands = [];
+    
+    // First, try to send Ctrl+C (SIGINT) to gracefully stop the server
+    stopCommands.push(`screen -X -S ${serverConfig.screen_name} stuff $'\\003'`);
+    
+    // Wait a moment for graceful shutdown
+    stopCommands.push('sleep 1');
+    
+    // Kill any python processes running this specific module (if server_module is set)
+    if (serverConfig.server_module) {
+      // Use pkill to find and kill python processes running this module
+      // The -f flag matches against the full command line
+      const modulePattern = serverConfig.server_module.replace(/\./g, '\\.');
+      stopCommands.push(`pkill -f "python.*${modulePattern}" 2>/dev/null || true`);
+      log.debug(`${serverName}: Will kill processes matching: python.*${modulePattern}`);
+    }
+    
+    // Finally, quit the screen session (ignore errors if already dead)
+    stopCommands.push(`screen -X -S ${serverConfig.screen_name} quit 2>/dev/null || true`);
+    
+    const stopCommand = stopCommands.join('; ');
+    log.debug(`${serverName}: Executing stop command: ${stopCommand}`);
+    
+    const result = await this.executeCommand(serverName, stopCommand);
+    
+    if (result.success) {
+      log.info(`${serverName}: Server stopped successfully`);
+    } else {
+      log.error(`${serverName}: Failed to stop server`);
+    }
+    
+    return result;
   }
 
   async restartServer(serverName) {
+    log.info(`Restarting server: ${serverName}`);
     const stopResult = await this.stopServer(serverName);
     if (!stopResult.success && !stopResult.sshDown) {
+      log.error(`${serverName}: Stop failed during restart`);
       return stopResult;
     }
-    return this.startServer(serverName);
+    
+    log.debug(`${serverName}: Stop complete, starting server`);
+    const startResult = await this.startServer(serverName);
+    
+    if (startResult.success) {
+      log.info(`${serverName}: Server restarted successfully`);
+    }
+    
+    return startResult;
   }
 
   async getServerStatus(serverName) {
     const serverConfig = this.config[serverName];
+    
+    if (!serverConfig) {
+      log.error(`Cannot get status: ${serverName} not found in config`);
+      return { success: false, error: 'Server not found' };
+    }
 
-    debugLog(`Checking status for ${serverName} on ${serverConfig.host}`);
+    log.debug(`${serverName}: Checking status on ${serverConfig.host}`);
     
     // Use the cached screen sessions if they exist for this host and are recent
     const host = serverConfig.host;
@@ -213,9 +450,11 @@ class SSHOperations {
     const now = Date.now();
     
     if (cachedData && (now - cachedData.timestamp) < 5000) { // Cache valid for 5 seconds
+      const status = cachedData.sessions.includes(serverConfig.screen_name);
+      log.debug(`${serverName}: Using cached status: ${status} (cache age: ${now - cachedData.timestamp}ms)`);
       return {
         success: true,
-        status: cachedData.sessions.includes(serverConfig.screen_name)
+        status: status
       };
     }
     
@@ -223,6 +462,7 @@ class SSHOperations {
     const result = await this.executeCommand(serverName, statusCommand, 500);
 
     if (!result.success) {
+      log.warn(`${serverName}: Failed to get status - SSH down`);
       return { success: false, sshDown: true };
     }
     
@@ -248,13 +488,14 @@ class SSHOperations {
       sessions: screenSessions
     };
 
-    debugLog(
-      `${serverName}: sessions on ${host} -> ${screenSessions.join(', ')}`
-    );
+    log.debug(`${serverName}: Found ${screenSessions.length} sessions on ${host}: ${screenSessions.join(', ') || '(none)'}`);
+    
+    const status = screenSessions.includes(serverConfig.screen_name);
+    log.debug(`${serverName}: Screen "${serverConfig.screen_name}" is ${status ? 'ACTIVE' : 'INACTIVE'}`);
     
     return {
       success: true,
-      status: screenSessions.includes(serverConfig.screen_name)
+      status: status
     };
   }
 
@@ -266,14 +507,16 @@ class SSHOperations {
     );
     
     if (!serverName) {
+      log.error(`No server configured for host ${host}`);
       return { success: false, error: `No server configured for host ${host}` };
     }
     
-    debugLog(`Batch status for host ${host} using ${serverName}`);
+    log.debug(`Batch status check for host ${host} using ${serverName}`);
     const statusCommand = 'screen -ls';
     const result = await this.executeCommand(serverName, statusCommand, 500);
     
     if (!result.success) {
+      log.warn(`Batch status check failed for host ${host} - SSH down`);
       return { success: false, sshDown: true, host };
     }
     
@@ -296,7 +539,8 @@ class SSHOperations {
       timestamp: now,
       sessions: screenSessions
     };
-    debugLog(`Host ${host} sessions: ${screenSessions.join(', ')}`);
+    
+    log.debug(`Host ${host}: Found ${screenSessions.length} screen sessions: ${screenSessions.join(', ') || '(none)'}`);
     
     return { success: true, host, sessions: screenSessions };
   }
@@ -315,55 +559,92 @@ class SSHOperations {
       hostMap[host].push(serverName);
     });
     
+    log.debug(`Servers grouped by host: ${Object.entries(hostMap).map(([h, s]) => `${h}(${s.length})`).join(', ')}`);
+    
     return hostMap;
   }
   
   async getServerLog(serverName, lines = 200) {
+    log.info(`Getting log for ${serverName} (last ${lines} lines)`);
     const serverConfig = this.config[serverName];
+    
+    if (!serverConfig) {
+      log.error(`Cannot get log: ${serverName} not found in config`);
+      return { success: false, error: 'Server not found' };
+    }
+    
     const logPath = path.join('.afl', `${serverConfig.screen_name}.screenlog`);
     const logCommand = `tail -n ${lines} $\{HOME}/${logPath}`;
-    return this.executeCommand(serverName, logCommand);
+    log.debug(`${serverName}: Log command: ${logCommand}`);
+    
+    const result = await this.executeCommand(serverName, logCommand);
+    
+    if (result.success) {
+      log.debug(`${serverName}: Retrieved ${result.output?.length || 0} bytes of log`);
+    } else {
+      log.error(`${serverName}: Failed to retrieve log`);
+    }
+    
+    return result;
   }
 
   async joinServer(serverName) {
+    log.info(`Joining server session: ${serverName}`);
     const serverConfig = this.config[serverName];
+    
+    if (!serverConfig) {
+      log.error(`Cannot join server: ${serverName} not found in config`);
+      return { success: false, error: 'Server not found' };
+    }
+    
     const joinCommand = `screen -x ${serverConfig.screen_name}`;
+    log.debug(`${serverName}: Join command: ${joinCommand}`);
     return this.executeCommand(serverName, joinCommand);
   }
 
   getServerForHost(host) {
     const entry = Object.entries(this.config).find(([, cfg]) => cfg.host === host);
-    if (!entry) return null;
+    if (!entry) {
+      log.debug(`No server found for host ${host}`);
+      return null;
+    }
+    log.debug(`Found server for host ${host}: ${entry[0]}`);
     return entry[1];
   }
 
   async readRemoteFile(host, remotePath) {
     const server = this.getServerForHost(host);
-    if (!server) return { success: false, error: `No server for host ${host}` };
-    console.log(`Reading remote file ${remotePath} from ${host}`);
+    if (!server) {
+      log.error(`Cannot read remote file: no server for host ${host}`);
+      return { success: false, error: `No server for host ${host}` };
+    }
+    
+    log.info(`Reading remote file ${remotePath} from ${host}`);
+    
     return new Promise((resolve) => {
       const conn = new Client();
       conn.on('ready', () => {
+        log.debug(`SFTP connection ready for ${host}`);
         conn.sftp((err, sftp) => {
           if (err) {
             conn.end();
-            console.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
+            log.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
             resolve({ success: false, error: err.message });
             return;
           }
           sftp.readFile(remotePath, 'utf8', (err, data) => {
             conn.end();
             if (err) {
-              console.error(`Failed to read ${remotePath} on ${host}:`, err.message);
+              log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
               resolve({ success: false, error: err.message });
             } else {
-              console.log(`Successfully read ${remotePath} from ${host}`);
+              log.info(`Successfully read ${remotePath} from ${host} (${data.length} bytes)`);
               resolve({ success: true, data });
             }
           });
         });
       }).on('error', (err) => {
-        console.error(`Connection error reading ${remotePath} on ${host}:`, err.message);
+        log.error(`Connection error reading ${remotePath} on ${host}:`, err.message);
         resolve({ success: false, error: err.message });
       }).connect({
         host: server.host,
@@ -376,34 +657,41 @@ class SSHOperations {
 
   async writeRemoteFile(host, remotePath, content) {
     const server = this.getServerForHost(host);
-    if (!server) return { success: false, error: `No server for host ${host}` };
-    console.log(`Writing remote file ${remotePath} to ${host}`);
+    if (!server) {
+      log.error(`Cannot write remote file: no server for host ${host}`);
+      return { success: false, error: `No server for host ${host}` };
+    }
+    
+    log.info(`Writing remote file ${remotePath} to ${host}`);
+    
     return new Promise((resolve) => {
       const conn = new Client();
       conn.on('ready', () => {
+        log.debug(`SFTP connection ready for ${host}`);
         conn.sftp((err, sftp) => {
           if (err) {
             conn.end();
-            console.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
+            log.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
             resolve({ success: false, error: err.message });
             return;
           }
           const dir = path.posix.dirname(remotePath);
+          log.debug(`Creating directory ${dir} on ${host}`);
           sftp.mkdir(dir, { mode: 0o755 }, () => {
             sftp.writeFile(remotePath, content, 'utf8', (err2) => {
               conn.end();
               if (err2) {
-                console.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
+                log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
                 resolve({ success: false, error: err2.message });
               } else {
-                console.log(`Successfully wrote ${remotePath} to ${host}`);
+                log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
                 resolve({ success: true });
               }
             });
           });
         });
       }).on('error', (err) => {
-        console.error(`Connection error writing ${remotePath} on ${host}:`, err.message);
+        log.error(`Connection error writing ${remotePath} on ${host}:`, err.message);
         resolve({ success: false, error: err.message });
       }).connect({
         host: server.host,
@@ -416,40 +704,62 @@ class SSHOperations {
 
   async getRemoteAflConfig(host) {
     const server = this.getServerForHost(host);
-    if (!server) return { success: false, error: `No server for host ${host}` };
+    if (!server) {
+      log.error(`Cannot get AFL config: no server for host ${host}`);
+      return { success: false, error: `No server for host ${host}` };
+    }
+    
     const remotePath = `/home/${server.username}/.afl/config.json`;
+    log.info(`Getting AFL config from ${host}: ${remotePath}`);
+    
     const res = await this.readRemoteFile(host, remotePath);
     if (!res.success) return res;
+    
     try {
       const parsed = JSON.parse(res.data);
-      console.log(`Parsed AFL config from ${host}`);
+      const keyCount = Object.keys(parsed).length;
+      log.info(`Parsed AFL config from ${host}: ${keyCount} entries`);
       return { success: true, data: parsed };
-    } catch (_) {
-      console.log(`Remote AFL config on ${host} is empty or invalid JSON`);
+    } catch (parseError) {
+      log.warn(`Remote AFL config on ${host} is empty or invalid JSON: ${parseError.message}`);
       return { success: true, data: {} };
     }
   }
 
   async saveRemoteAflConfig(host, cfgObj) {
     const server = this.getServerForHost(host);
-    if (!server) return { success: false, error: `No server for host ${host}` };
+    if (!server) {
+      log.error(`Cannot save AFL config: no server for host ${host}`);
+      return { success: false, error: `No server for host ${host}` };
+    }
+    
     const remotePath = `/home/${server.username}/.afl/config.json`;
-    console.log(`Saving AFL config to ${remotePath} on ${host}`);
+    log.info(`Saving AFL config to ${remotePath} on ${host}`);
+    
     let existing = {};
     const read = await this.readRemoteFile(host, remotePath);
     if (read.success && read.data) {
-      try { existing = JSON.parse(read.data); } catch (_) {}
+      try { 
+        existing = JSON.parse(read.data);
+        log.debug(`Loaded existing config with ${Object.keys(existing).length} entries`);
+      } catch (e) {
+        log.debug(`Could not parse existing config: ${e.message}`);
+      }
     }
+    
     const now = new Date();
     const pad = n => String(n).padStart(2, '0');
     const micros = String(now.getMilliseconds() * 1000).padStart(6, '0');
     const ts = `${String(now.getFullYear()).slice(-2)}/${pad(now.getDate())}/${pad(now.getMonth() + 1)} ` +
                `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${micros}`;
+    
     existing[ts] = cfgObj;
     const content = JSON.stringify(existing, null, 2);
+    log.debug(`Saving config with timestamp ${ts}`);
+    
     const res = await this.writeRemoteFile(host, remotePath, content);
     if (res.success) {
-      console.log(`AFL config saved on ${host}`);
+      log.info(`AFL config saved successfully on ${host}`);
     }
     return res;
   }
