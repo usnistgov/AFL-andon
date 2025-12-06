@@ -403,8 +403,16 @@ class SSHOperations {
     
     let stopCommands = [];
     
+    const remoteOs = await this.getRemoteOs(serverName);
+    const isMacOs = remoteOs === 'darwin';
+    log.debug(`${serverName}: Remote OS is ${remoteOs}, isMacOs=${isMacOs}`);
+    
+    const ctrlCCommand = isMacOs
+      ? `screen -S ${serverConfig.screen_name} -p 0 -X stuff $'\\003'`
+      : `screen -X -S ${serverConfig.screen_name} stuff $'\\003'`;
+    
     // First, try to send Ctrl+C (SIGINT) to gracefully stop the server
-    stopCommands.push(`screen -X -S ${serverConfig.screen_name} stuff $'\\003'`);
+    stopCommands.push(ctrlCCommand);
     
     // Wait a moment for graceful shutdown
     stopCommands.push('sleep 1');
