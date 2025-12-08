@@ -12,6 +12,13 @@ const SSHOperations = require('./sshOperations');
 let mainWindow;
 let sshOps;
 
+const ICON_PATH_MAC = path.join(__dirname, 'assets', 'icons', 'mac', 'icon.icns');
+const ICON_PATH_PNG = path.join(__dirname, 'assets', 'icons', 'png', '256x256.png');
+
+function getAppIconPath() {
+  return process.platform === 'darwin' ? ICON_PATH_MAC : ICON_PATH_PNG;
+}
+
 // Set default paths (use os.homedir() since app.getPath() isn't available at load time)
 let configPath = path.join(os.homedir(), '.afl', 'launchers.json');
 let sshKeyPath = path.join(os.homedir(), '.ssh', 'id_rsa');
@@ -45,10 +52,12 @@ if (argSshKeyPath) {
 
 async function createWindow() {
   log.info('Creating main window');
+  const iconPath = getAppIconPath();
+  log.debug(`Using icon: ${iconPath}`);
   mainWindow = new BrowserWindow({
     width: 800,
     height: 600,
-    icon: path.join(__dirname, 'assets', 'icons', 'png', '256x256.png'), // Use PNG for all platforms in dev
+    icon: iconPath,
       webPreferences: {
         nodeIntegration: true,
         contextIsolation: false,
@@ -68,6 +77,16 @@ app.whenReady().then(async () => {
   log.debug(`Node version: ${process.versions.node}`);
   log.debug(`Chrome version: ${process.versions.chrome}`);
   log.info(`Log file location: ${logFilePath}`);
+
+  const iconPath = getAppIconPath();
+  if (process.platform === 'darwin' && app.dock) {
+    try {
+      await app.dock.setIcon(iconPath);
+      log.debug(`macOS dock icon set: ${iconPath}`);
+    } catch (error) {
+      log.warn(`Failed to set macOS dock icon: ${error.message}`);
+    }
+  }
   
   try {
     sshOps = new SSHOperations(configPath, sshKeyPath);
