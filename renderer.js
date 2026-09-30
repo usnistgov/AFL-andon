@@ -1,9 +1,21 @@
 // renderer.js (Renderer process)
 const { ipcRenderer } = require('electron');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const JSONEditor = require('jsoneditor');
-const { createLogger } = require('./logger');
+const { createLogger, setLogSink } = require('./logger');
+const { serverActivityPresentation } = require('./serverStatus');
+const {
+  MAX_MERGED_LINES,
+  decodeLogChunk,
+  stripTerminalControl,
+  capEntries,
+  filterEntries,
+  stableServerColor,
+  isRoutineHealthLog
+} = require('./allLogs');
 
 const log = createLogger('renderer');
 
@@ -18,8 +30,6 @@ try {
   fetchFn = global.fetch;
 }
 
-log.info('Renderer process starting');
-
 let config;
 let editingServer = null;
 let aflConfig = {};
@@ -31,12 +41,272 @@ let sshStream;
 let terminal;
 let currentServerName;
 let activeTab = null;
+let loadedWebviewServerName = null;
 let inactiveExpanded = false;
 const startedServers = new Set();
+const displayedServerStatuses = new Map();
+const allLogServers = new Map();
+let mergedLogEntries = [];
+let allLogsPaused = false;
+const logChunkRemainders = new Map();
+let allLogsRenderTimer = null;
+let lastSessionLogSequence = 0;
+let allLogsSyncTimer = null;
+let allLogsSyncRunning = false;
+let sshPasswordPromptResolve = null;
+
+setLogSink(({ level, moduleName, text, observedAt }) => {
+  if (!['error', 'warn', 'info'].includes(level)) return;
+  const entries = String(text).split(/\r?\n/).map(line => ({
+    server: 'Andon',
+    text: `[${level.toUpperCase()}] [${moduleName}] ${line}`,
+    observedAt,
+    type: 'app'
+  }));
+  addMergedLogEntries(entries);
+  scheduleAllLogsRender();
+});
+
+log.info('Renderer process starting');
+
+function requestSshPassword(serverName) {
+  const modal = document.getElementById('ssh-password-modal');
+  const form = document.getElementById('ssh-password-form');
+  const input = document.getElementById('ssh-password-input');
+  const label = document.getElementById('ssh-password-label');
+  label.textContent = `SSH password for ${config[serverName].username}@${config[serverName].host}`;
+  input.value = '';
+  modal.style.display = 'block';
+  setTimeout(() => input.focus(), 0);
+
+  return new Promise(resolve => {
+    sshPasswordPromptResolve = resolve;
+    form.dataset.serverName = serverName;
+  });
+}
+
+function finishSshPasswordPrompt(password = null) {
+  const modal = document.getElementById('ssh-password-modal');
+  const input = document.getElementById('ssh-password-input');
+  modal.style.display = 'none';
+  input.value = '';
+  const resolve = sshPasswordPromptResolve;
+  sshPasswordPromptResolve = null;
+  resolve?.(password);
+}
+
+async function ensureSshPassword(serverName, forcePrompt = false) {
+  const server = config?.[serverName];
+  if (server?.tiled_management?.authentication !== 'password') return true;
+  if (!forcePrompt) {
+    const status = await ipcRenderer.invoke('has-session-ssh-password', serverName);
+    if (status.available) return true;
+  }
+  const password = await requestSshPassword(serverName);
+  if (password === null) return false;
+  const result = await ipcRenderer.invoke('set-session-ssh-password', serverName, password);
+  if (!result.success) {
+    alert(result.error || 'Could not set the SSH password.');
+    return false;
+  }
+  return true;
+}
+
+function ensureAllLogServer(serverName) {
+  if (!allLogServers.has(serverName)) {
+    allLogServers.set(serverName, {
+      enabled: true,
+      lifecycle: 'running',
+      connection: 'waiting',
+      error: ''
+    });
+  }
+  return allLogServers.get(serverName);
+}
+
+function addMergedLogEntries(entries, { persist = true } = {}) {
+  if (!entries.length) return;
+  mergedLogEntries = capEntries(mergedLogEntries.concat(entries), MAX_MERGED_LINES);
+  if (persist) ipcRenderer.send('append-combined-log-entries', entries);
+}
+
+function formatObservationTime(value) {
+  return new Date(value).toLocaleTimeString([], {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    fractionalSecondDigits: 3
+  });
+}
+
+function renderAllLogFilters() {
+  const container = document.getElementById('all-logs-filters');
+  if (!container) return;
+  container.replaceChildren();
+  for (const [serverName, state] of allLogServers) {
+    const label = document.createElement('label');
+    label.className = `all-logs-filter ${state.lifecycle === 'stopped' ? 'stopped' : ''} ${state.connection === 'failed' ? 'failed' : ''}`;
+    label.title = state.lifecycle === 'stopped' ? 'Stopped; collected history is retained' : (state.error || 'Connected');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.enabled;
+    checkbox.addEventListener('change', () => {
+      state.enabled = checkbox.checked;
+      renderAllLogs();
+    });
+    const text = document.createElement('span');
+    text.textContent = `${serverName}${state.lifecycle === 'stopped' ? ' (stopped)' : ''}`;
+    text.style.color = stableServerColor(serverName);
+    label.append(checkbox, text);
+    container.appendChild(label);
+  }
+}
+
+function renderAllLogs() {
+  const output = document.getElementById('all-logs-output');
+  if (!output) return;
+  const keepAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 24;
+  const enabled = new Set([...allLogServers].filter(([, state]) => state.enabled).map(([name]) => name));
+  const search = document.getElementById('all-logs-search')?.value || '';
+  const entries = filterEntries(mergedLogEntries, enabled, search);
+  const fragment = document.createDocumentFragment();
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.id = 'all-logs-empty';
+    empty.textContent = allLogServers.size
+      ? 'No log lines match the current filters.'
+      : 'Start or restart a server to begin collecting logs.';
+    fragment.appendChild(empty);
+  } else {
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      row.className = `all-log-line${entry.type === 'system' ? ' all-log-system' : ''}`;
+      const time = document.createElement('span');
+      time.className = 'all-log-time';
+      time.textContent = `[${formatObservationTime(entry.observedAt)}] `;
+      const server = document.createElement('span');
+      server.className = 'all-log-server';
+      server.style.color = stableServerColor(entry.server);
+      server.textContent = `[${entry.server}] `;
+      row.append(time, server, document.createTextNode(entry.text));
+      fragment.appendChild(row);
+    }
+  }
+  output.replaceChildren(fragment);
+  if (document.getElementById('all-logs-autoscroll')?.checked && keepAtBottom) {
+    output.scrollTop = output.scrollHeight;
+  }
+}
+
+function updateAllLogsStatus(message) {
+  const status = document.getElementById('all-logs-status');
+  if (status) status.textContent = message;
+}
+
+function updateAllLogsStreamSummary() {
+  const running = [...allLogServers.values()].filter(state => state.lifecycle === 'running');
+  const connected = running.filter(state => state.connection === 'connected').length;
+  if (!running.length) {
+    updateAllLogsStatus(allLogsPaused ? 'Paused — no running servers' : 'No running servers');
+  } else {
+    updateAllLogsStatus(`${allLogsPaused ? 'Paused — ' : ''}${connected}/${running.length} streaming · ${mergedLogEntries.length.toLocaleString()} lines`);
+  }
+}
+
+function showAllLogsPanel() {
+  clearTimeout(allLogsRenderTimer);
+  allLogsRenderTimer = null;
+  renderAllLogFilters();
+  renderAllLogs();
+  updateAllLogsStreamSummary();
+}
+
+function scheduleAllLogsRender() {
+  if (activeTab !== 'all-logs' || allLogsPaused || allLogsRenderTimer) return;
+  allLogsRenderTimer = setTimeout(() => {
+    allLogsRenderTimer = null;
+    renderAllLogs();
+    updateAllLogsStreamSummary();
+  }, 50);
+}
+
+function handleServerLogStream({ serverName, type, data = '', status, error = '', reset = false, observedAt = Date.now(), persisted = false }) {
+  const state = ensureAllLogServer(serverName);
+  if (reset) logChunkRemainders.delete(serverName);
+  if (type === 'data') {
+    const decoded = decodeLogChunk(logChunkRemainders.get(serverName) || '', stripTerminalControl(data));
+    logChunkRemainders.set(serverName, decoded.remainder);
+    const entries = decoded.lines
+      .filter(text => !isRoutineHealthLog(serverName, config?.[serverName], text))
+      .map(text => ({ server: serverName, text, observedAt, type: 'log' }));
+    addMergedLogEntries(entries, { persist: !persisted });
+  } else if (type === 'status') {
+    if (status === 'stopped') {
+      const remainder = logChunkRemainders.get(serverName) || '';
+      if (remainder && !isRoutineHealthLog(serverName, config?.[serverName], remainder)) {
+        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log' }]);
+      }
+      logChunkRemainders.delete(serverName);
+      state.lifecycle = 'stopped';
+      state.connection = 'stopped';
+    } else if (status === 'connected') {
+      if (state.connection === 'failed') {
+        addMergedLogEntries([{ server: serverName, text: 'Log connection recovered.', observedAt, type: 'system' }]);
+      }
+      state.lifecycle = 'running';
+      state.connection = 'connected';
+      state.error = '';
+    } else if (status === 'failed') {
+      if (state.connection !== 'failed' || state.error !== error) {
+        addMergedLogEntries([{ server: serverName, text: `Log connection failed: ${error}`, observedAt, type: 'system' }]);
+      }
+      state.connection = 'failed';
+      state.error = error;
+    }
+    renderAllLogFilters();
+  }
+  scheduleAllLogsRender();
+  if (type === 'status') updateAllLogsStreamSummary();
+}
+
+function receiveServerLogEvent(payload) {
+  if (payload.sequence) {
+    if (payload.sequence <= lastSessionLogSequence) return;
+    lastSessionLogSequence = payload.sequence;
+  }
+  handleServerLogStream(payload);
+}
+
+async function syncSessionLogEvents() {
+  if (allLogsSyncRunning) return;
+  allLogsSyncRunning = true;
+  try {
+    const result = await ipcRenderer.invoke('get-session-log-events', lastSessionLogSequence);
+    for (const event of result.events || []) receiveServerLogEvent(event);
+    lastSessionLogSequence = Math.max(lastSessionLogSequence, result.latestSequence || 0);
+  } catch (error) {
+    log.warn(`Could not synchronize live log events: ${error.message}`);
+  } finally {
+    allLogsSyncRunning = false;
+  }
+}
+
+function startAllLogsSync() {
+  clearInterval(allLogsSyncTimer);
+  syncSessionLogEvents();
+  allLogsSyncTimer = setInterval(syncSessionLogEvents, 250);
+}
+
+function stopAllLogsSync() {
+  clearInterval(allLogsSyncTimer);
+  allLogsSyncTimer = null;
+}
 
 async function joinServer(serverName) {
   log.info(`Joining server: ${serverName}`);
   try {
+    if (!await ensureSshPassword(serverName)) return;
     // Close existing connection if any
     if (currentServerName) {
       log.debug(`Closing existing connection to ${currentServerName}`);
@@ -219,13 +489,22 @@ async function fetchQueueState(serverName) {
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
+  if (serverConfig.server_type === 'tiled') {
+    const result = await ipcRenderer.invoke('tiled-ping', serverName);
+    return {
+      ok: !!result?.ok,
+      state: result?.state || null,
+      url: result?.url || url,
+      reason: result?.reason || null
+    };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 500);
   try {
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
       const reason = `HTTP ${response.status} from ${url}`;
-      log.warn(`${serverName}: ${reason}`);
+      log.debug(`${serverName}: ${reason}`);
       return { ok: false, state: null, url, reason };
     }
     if (serverConfig.device) {
@@ -253,7 +532,7 @@ async function fetchQueueState(serverName) {
     const reason = err?.name === 'AbortError'
       ? `Timed out reaching ${url}`
       : `Cannot reach ${url}: ${err?.message || 'connection failed'}`;
-    log.warn(`${serverName}: ${reason}`);
+    log.debug(`${serverName}: ${reason}`);
     return { ok: false, state: null, url, reason };
   } finally {
     clearTimeout(timer);
@@ -267,6 +546,9 @@ async function updateServerStatus(serverName) {
     const result = await ipcRenderer.invoke('get-server-status', serverName);
     const queueResult = await fetchQueueState(serverName);
 
+    // Stop can be clicked while either request is in flight. Do not let that
+    // stale response repaint a disconnected server as active.
+    if (!startedServers.has(serverName)) return;
     updateServerStatusUI(serverName, result, queueResult);
   } catch (error) {
     log.error(`Error getting status for ${serverName}:`, error.message);
@@ -277,53 +559,71 @@ async function updateServerStatus(serverName) {
 function updateServerStatusUI(serverName, screenResult, queueResult) {
   const screenStatusElement = document.getElementById(`${serverName}-screen-status`);
   const httpStatusElement = document.getElementById(`${serverName}-http-status`);
+  const sshConnected = screenResult.success &&
+    !screenResult.sshDown &&
+    !screenResult.authenticationRequired;
+  const serverStatus = serverActivityPresentation(queueResult);
   
   if (screenStatusElement) {
-    if (screenResult.sshDown) {
-      screenStatusElement.textContent = 'SSH DOWN';
-      screenStatusElement.className = 'status-indicator status-down';
+    screenStatusElement.textContent = sshConnected ? 'SSH UP' : 'SSH DOWN';
+    screenStatusElement.className = `status-indicator ${sshConnected ? 'status-up' : 'status-down'}`;
+    if (screenResult.authenticationRequired) {
+      screenStatusElement.title = 'Click Start and enter the NAS SSH password to enable management and status checks.';
+    } else if (screenResult.managementType === 'docker_compose') {
+      screenStatusElement.title = screenResult.status
+        ? 'SSH is connected and the configured Docker Compose service is running.'
+        : 'SSH is connected, but the configured Docker Compose service is not running.';
+    } else if (screenResult.external || config[serverName]?.external_service) {
+      screenStatusElement.title = 'This service is monitored by Andon but managed outside Andon.';
+    } else if (screenResult.sshDown) {
+      screenStatusElement.title = 'Andon could not establish the SSH connection.';
     } else if (screenResult.screenState === 'dead') {
-      screenStatusElement.textContent = 'SCREEN EXITED';
-      screenStatusElement.className = 'status-indicator status-down';
-      screenStatusElement.title = 'The screen session has exited; view the server log for the cause.';
+      screenStatusElement.title = 'SSH is connected, but the Screen session has exited; view the server log for the cause.';
     } else {
-      screenStatusElement.textContent = screenResult.status ? 'SCREEN ACTIVE' : 'SCREEN DOWN';
-      screenStatusElement.className = `status-indicator ${screenResult.status ? 'status-up' : 'status-down'}`;
-      screenStatusElement.title = screenResult.status ? '' : 'No live screen session was found.';
+      screenStatusElement.title = screenResult.status
+        ? 'SSH is connected and the Screen session is active.'
+        : (sshConnected ? 'SSH is connected, but no live Screen session was found.' : 'SSH is disconnected.');
     }
   }
   
   if (httpStatusElement) {
-    if (queueResult.ok) {
-      const serverCfg = config[serverName] || {};
-      const state = typeof queueResult.state === 'string' ? queueResult.state.trim() : '';
-      httpStatusElement.textContent = serverCfg.device || !state
-        ? 'SERVER UP'
-        : `SERVER ${state.toUpperCase()}`;
-      httpStatusElement.className = 'status-indicator status-up';
-    } else {
-      httpStatusElement.textContent = 'UNREACHABLE';
-      httpStatusElement.className = 'status-indicator status-down';
-      httpStatusElement.title = '';
-    }
+    httpStatusElement.textContent = serverStatus.label;
+    httpStatusElement.className = `status-indicator ${serverStatus.cardClass}`;
+    httpStatusElement.title = serverStatus.state === 'down'
+      ? (queueResult?.reason || 'The server HTTP API is not reachable.')
+      : '';
   }
 
-  updateTabStatus(serverName, queueResult);
+  updateTabStatus(serverName, queueResult, screenResult);
+  logServerStatusChange(serverName, sshConnected, serverStatus.state);
 }
 
-function showServerDownStatus(serverName) {
+function logServerStatusChange(serverName, sshConnected, serverState) {
+  const status = `${sshConnected ? 'SSH UP' : 'SSH DOWN'}, SERVER ${serverState.toUpperCase()}`;
+  if (displayedServerStatuses.get(serverName) === status) return;
+  displayedServerStatuses.set(serverName, status);
+  log.info(`${serverName}: status changed to ${status}`);
+}
+
+function showServerDownStatus(serverName, disconnected = false) {
   const screenStatusElement = document.getElementById(`${serverName}-screen-status`);
   const httpStatusElement = document.getElementById(`${serverName}-http-status`);
   if (screenStatusElement) {
-    screenStatusElement.textContent = 'SCREEN DOWN';
+    screenStatusElement.textContent = 'SSH DOWN';
     screenStatusElement.className = 'status-indicator status-down';
-    screenStatusElement.title = '';
+    screenStatusElement.title = disconnected
+      ? 'Andon is disconnected; the remote container was not changed.'
+      : '';
   }
   if (httpStatusElement) {
     httpStatusElement.textContent = 'SERVER DOWN';
     httpStatusElement.className = 'status-indicator status-down';
-    httpStatusElement.title = '';
+    httpStatusElement.title = disconnected
+      ? 'Andon is no longer polling this server.'
+      : '';
   }
+  updateTabStatus(serverName, { ok: false }, { status: false });
+  logServerStatusChange(serverName, false, 'down');
 }
 
 // Batch update server statuses by host
@@ -333,6 +633,9 @@ async function batchUpdateServerStatuses() {
     // Andon session. This avoids probing launchers that have not been started.
     const allByHost   = await ipcRenderer.invoke('get-servers-by-host');
     const startedByHost = {};
+
+    const externalServers = [...startedServers].filter(name => config[name]?.external_service);
+    await Promise.all(externalServers.map(name => updateServerStatus(name)));
 
     for (const [host, names] of Object.entries(allByHost)) {
       const startedNames = names.filter(name => startedServers.has(name));
@@ -349,7 +652,7 @@ async function batchUpdateServerStatuses() {
 
         if (!batchResult.success) {
           // If SSH is down for this host, update all servers on this host
-          log.warn(`SSH down for host ${host}, marking all servers as down`);
+          log.debug(`SSH down for host ${host}, marking all servers as down`);
           servers.forEach(serverName => {
             updateServerStatusUI(serverName, { sshDown: true }, false);
           });
@@ -361,6 +664,7 @@ async function batchUpdateServerStatuses() {
 
         await Promise.all(
           servers.map(async serverName => {
+            if (!startedServers.has(serverName)) return;
             const serverConfig = config[serverName];
             if (!serverConfig) {
               log.warn(`No config for server ${serverName}`);
@@ -385,7 +689,9 @@ async function batchUpdateServerStatuses() {
             }
 
             // Update the UI
-            updateServerStatusUI(serverName, screenStatus, queueResult);
+            if (startedServers.has(serverName)) {
+              updateServerStatusUI(serverName, screenStatus, queueResult);
+            }
           })
         );
       })
@@ -397,23 +703,86 @@ async function batchUpdateServerStatuses() {
 
 async function controlServer(serverName, action) {
   log.info(`Controlling server ${serverName}: ${action}`);
-  showServerDownStatus(serverName);
+  const disconnectOnly = action === 'stop' &&
+    config?.[serverName]?.tiled_management?.type === 'docker_compose';
+  const wasStarted = startedServers.has(serverName);
   try {
+    if (!disconnectOnly && !await ensureSshPassword(serverName, action === 'start' || action === 'restart')) return;
+    if (action === 'stop') {
+      startedServers.delete(serverName);
+    }
+    showServerDownStatus(serverName, disconnectOnly);
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
     if (result.success) {
       log.info(`${action} successful for ${serverName}`);
+    } else if (result.authenticationRequired) {
+      log.warn(`SSH authentication is required for ${serverName}`);
+      alert(`SSH authentication failed for ${serverName}. Click Start and enter the password again.`);
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
     } else {
       log.error(`${action} failed for ${serverName}:`, result.error || 'Unknown error');
     }
     if (result.success && (action === 'start' || action === 'restart')) {
+      const stream = await ipcRenderer.invoke('activate-server-log-stream', serverName);
+      handleServerLogStream({
+        serverName,
+        type: 'status',
+        status: stream.success ? stream.status : 'failed',
+        error: stream.error || '',
+        reset: true,
+        observedAt: Date.now()
+      });
+      for (const chunk of stream.chunks || []) {
+        handleServerLogStream({ serverName, type: 'data', ...chunk });
+      }
+      const startupRemainder = logChunkRemainders.get(serverName) || '';
+      if (startupRemainder && !isRoutineHealthLog(serverName, config?.[serverName], startupRemainder)) {
+        addMergedLogEntries([{
+          server: serverName,
+          text: startupRemainder,
+          observedAt: Date.now(),
+          type: 'log'
+        }]);
+        logChunkRemainders.delete(serverName);
+        scheduleAllLogsRender();
+      }
       startedServers.add(serverName);
+      const logState = ensureAllLogServer(serverName);
+      logState.lifecycle = 'running';
+      renderAllLogFilters();
       await updateServerStatus(serverName);
+      updateAllLogsStreamSummary();
     }
-    if (result.success && action === 'stop') startedServers.delete(serverName);
+    if (result.success && action === 'stop') {
+      showServerDownStatus(serverName, disconnectOnly);
+      disconnectServerWebview(serverName);
+      if (currentServerName === serverName) {
+        document.getElementById('terminal-modal').style.display = 'none';
+        currentServerName = null;
+      }
+      const logState = allLogServers.get(serverName);
+      if (logState) {
+        logState.lifecycle = 'stopped';
+        logState.connection = 'stopped';
+      }
+      renderAllLogFilters();
+      renderAllLogs();
+      updateAllLogsStreamSummary();
+    } else if (!result.success && action === 'stop') {
+      if (wasStarted) {
+        startedServers.add(serverName);
+        await updateServerStatus(serverName);
+      }
+    }
   } catch (error) {
     log.error(`Error during ${action} for ${serverName}:`, error.message);
+    if (action === 'stop') {
+      if (wasStarted) {
+        startedServers.add(serverName);
+        await updateServerStatus(serverName);
+      }
+    }
   }
 }
 
@@ -421,6 +790,7 @@ async function controlServer(serverName, action) {
 async function viewServerLog(serverName) {
   log.info(`Viewing log for ${serverName}`);
   try {
+    if (!await ensureSshPassword(serverName)) return;
     const result = await ipcRenderer.invoke('get-server-log', serverName, 200); // Request 200 lines
     if (result.success) {
       log.debug(`Retrieved log for ${serverName}: ${result.output?.length || 0} bytes`);
@@ -436,6 +806,8 @@ async function viewServerLog(serverName) {
 
       // Scroll to the bottom
       logContent.scrollTop = logContent.scrollHeight;
+    } else if (result.authenticationRequired) {
+      alert(`SSH authentication is required for ${serverName}.`);
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
       alert(`Unable to get log: SSH is down for ${serverName}`);
@@ -468,6 +840,18 @@ function createServerTabs() {
   andonLi.appendChild(andonIcon);
   andonLi.onclick = openAndonPanel;
   tabList.appendChild(andonLi);
+
+  const logsLi = document.createElement('li');
+  logsLi.className = 'tab-item';
+  logsLi.id = 'all-logs-tab';
+  logsLi.dataset.server = 'all-logs';
+  logsLi.title = 'All Logs';
+  const logsIcon = document.createElement('div');
+  logsIcon.className = 'tab-icon';
+  logsIcon.textContent = '≣';
+  logsLi.appendChild(logsIcon);
+  logsLi.onclick = () => setActiveTab('all-logs');
+  tabList.appendChild(logsLi);
   
   let activeCount = 0;
   Object.keys(config).forEach(serverName => {
@@ -481,7 +865,9 @@ function createServerTabs() {
     icon.className = 'tab-icon status-red';
     icon.textContent = serverConfig.icon || serverName.charAt(0).toUpperCase();
     li.appendChild(icon);
-    li.title = serverName;
+    li.dataset.status = 'down';
+    li.title = `${serverName}: DOWN`;
+    li.setAttribute('aria-label', `${serverName}: down`);
     li.onclick = () => openServerWebview(serverName);
     tabList.appendChild(li);
   });
@@ -500,35 +886,22 @@ function createServerTabs() {
   log.debug(`Created tabs for ${activeCount} active servers`);
 }
 
-function updateTabStatus(serverName, queueResult) {
+function updateTabStatus(serverName, queueResult, screenResult = {}) {
   const tab = document.querySelector(`.tab-item[data-server="${serverName}"] .tab-icon`);
   if (!tab) return;
-  tab.classList.remove('status-green','status-blue','status-yellow','status-red');
-  let cls = 'status-red';
-  if (queueResult.ok) {
-    const serverCfg = config[serverName] || {};
-    if (serverCfg.device) {
-      cls = 'status-green';
-    } else {
-      switch ((queueResult.state || '').toLowerCase()) {
-        case 'paused':
-          cls = 'status-yellow';
-          break;
-        case 'active':
-          cls = 'status-blue';
-          break;
-        case 'ready':
-          cls = 'status-green';
-          break;
-        default:
-          cls = 'status-red';
-      }
-    }
+  tab.classList.remove('status-green','status-yellow','status-red');
+  const presentation = serverActivityPresentation(queueResult);
+  tab.classList.add(presentation.sidebarClass);
+  const button = tab.closest('.tab-item');
+  if (button) {
+    button.dataset.status = presentation.state;
+    button.title = `${serverName}: ${presentation.state.toUpperCase()}`;
+    button.setAttribute('aria-label', `${serverName}: ${presentation.state}`);
   }
-  tab.classList.add(cls);
 }
 
 function setActiveTab(name) {
+  const wasAllLogs = activeTab === 'all-logs';
   activeTab = name;
   log.debug(`Setting active tab: ${name}`);
   document.querySelectorAll('.tab-item').forEach(item => item.classList.remove('selected'));
@@ -537,25 +910,46 @@ function setActiveTab(name) {
   const andon = document.getElementById('andon-panel');
   const webviewContainer = document.getElementById('webview-container');
   const settings = document.getElementById('settings-panel');
+  const allLogs = document.getElementById('all-logs-panel');
   if (name === 'andon') {
     webviewContainer.style.display = 'none';
     settings.style.display = 'none';
+    allLogs.style.display = 'none';
     andon.style.display = 'block';
   } else if (name === 'settings') {
     andon.style.display = 'none';
     webviewContainer.style.display = 'none';
+    allLogs.style.display = 'none';
     settings.style.display = 'block';
+  } else if (name === 'all-logs') {
+    andon.style.display = 'none';
+    webviewContainer.style.display = 'none';
+    settings.style.display = 'none';
+    allLogs.style.display = 'flex';
   } else {
     andon.style.display = 'none';
     settings.style.display = 'none';
+    allLogs.style.display = 'none';
     webviewContainer.style.display = 'flex';
+  }
+  if (name === 'all-logs' && !wasAllLogs) {
+    allLogsPaused = false;
+    const pauseButton = document.getElementById('all-logs-pause');
+    if (pauseButton) pauseButton.textContent = 'Pause';
+    showAllLogsPanel();
+    startAllLogsSync();
+  }
+  if (name !== 'all-logs' && wasAllLogs) {
+    clearTimeout(allLogsRenderTimer);
+    allLogsRenderTimer = null;
+    stopAllLogsSync();
   }
 }
 
 function openAndonPanel() {
   log.debug('Opening Andon panel');
-  const webview = document.getElementById('server-webview');
-  webview.src = '';
+  // Keep the webview loaded while it is hidden. Clearing src while a page is
+  // loading makes Electron reject GUEST_VIEW_MANAGER_CALL with ERR_ABORTED.
   setActiveTab('andon');
 }
 
@@ -571,11 +965,30 @@ function openServerWebview(serverName) {
   const serverConfig = config[serverName];
   setActiveTab(serverName);
   const webview = document.getElementById('server-webview');
+  loadedWebviewServerName = serverName;
+  if (serverConfig.server_type === 'tiled' || String(serverName).trim().toLowerCase() === 'tiled') {
+    const browserUrl = pathToFileURL(path.join(__dirname, 'tiled', 'browser', 'index.html'));
+    browserUrl.searchParams.set('server', serverName);
+    log.debug(`Loading bundled Tiled browser: ${browserUrl}`);
+    const url = browserUrl.toString();
+    if (webview.getAttribute('src') !== url) webview.src = url;
+    activeTab = serverName;
+    return;
+  }
   const url = serverConfig.webview_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/`;
   log.debug(`Loading URL: ${url}`);
-  webview.src = url;
+  if (webview.getAttribute('src') !== url) webview.src = url;
   activeTab = serverName;
+}
+
+function disconnectServerWebview(serverName) {
+  if (loadedWebviewServerName !== serverName) return;
+  const webview = document.getElementById('server-webview');
+  webview.stop?.();
+  webview.src = 'about:blank';
+  loadedWebviewServerName = null;
+  if (activeTab === serverName) openAndonPanel();
 }
 
 function closeServerWebview() {
@@ -632,7 +1045,7 @@ function createServerControls(serverName) {
 
   const screenStatusElement = document.createElement('span');
   screenStatusElement.id = `${serverName}-screen-status`;
-  screenStatusElement.textContent = 'SCREEN DOWN';
+  screenStatusElement.textContent = 'SSH DOWN';
   screenStatusElement.className = 'status-indicator status-down';
   statusContainer.appendChild(screenStatusElement);
 
@@ -689,9 +1102,12 @@ function openServerModal(serverName = null) {
     form.elements['server-username'].value = server.username;
     form.elements['server-http-port'].value = server.httpPort;
     form.elements['server-screen-name'].value = server.screen_name;
-    form.elements['server-type'].value = server.server_script ? 'script' : 'module';
+    form.elements['server-type'].value = server.server_type === 'tiled'
+      ? 'tiled'
+      : (server.server_script ? 'script' : 'module');
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
+    form.elements['server-config-file-location'].value = server.config_file_location || '';
     form.elements['server-shell'].value = server.shell || 'bash';
     form.elements['server-env-type'].value = server.env_type || (server.conda_env ? 'conda' : 'pip');
     form.elements['server-conda-env'].value = server.conda_env || '';
@@ -710,6 +1126,7 @@ function openServerModal(serverName = null) {
     form.elements['server-device'].checked = false;
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
+    form.elements['server-config-file-location'].value = '';
     form.elements['server-active'].checked = true;
     form.elements['server-env-type'].value = 'conda';
   }
@@ -723,6 +1140,14 @@ function updateServerTypeFields() {
   const serverType = document.getElementById('server-type').value;
   document.getElementById('script-group').style.display = serverType === 'script' ? 'block' : 'none';
   document.getElementById('module-group').style.display = serverType === 'module' ? 'block' : 'none';
+  const configInput = document.getElementById('server-config-file-location');
+  const isTiled = serverType === 'tiled';
+  configInput.required = isTiled;
+  configInput.placeholder = isTiled ? '/path/to/tiled_config.yml' : '/path/to/server-config.json';
+  document.getElementById('server-shell').closest('.form-group').style.display = isTiled ? 'none' : 'block';
+  document.getElementById('server-env-type').closest('.form-group').style.display = 'block';
+  document.getElementById('conda-group').style.display = document.getElementById('server-env-type').value === 'conda' ? 'block' : 'none';
+  document.getElementById('virtualenv-group').style.display = document.getElementById('server-env-type').value === 'pip' ? 'block' : 'none';
 }
 
 function updateEnvTypeFields() {
@@ -748,11 +1173,17 @@ async function handleServerFormSubmit(event) {
   };
 
   const serverType = form.elements['server-type'].value;
-  if (serverType === 'script') {
+  if (serverType === 'tiled') {
+    serverConfig.server_type = 'tiled';
+    serverConfig.shell = 'bash';
+  } else if (serverType === 'script') {
     serverConfig.server_script = form.elements['server-script'].value;
   } else {
     serverConfig.server_module = form.elements['server-module'].value;
   }
+
+  // Keep an empty value so an edit can explicitly clear a prior selection.
+  serverConfig.config_file_location = form.elements['server-config-file-location'].value.trim();
 
   const envType = form.elements['server-env-type'].value;
   serverConfig.env_type = envType;
@@ -799,6 +1230,7 @@ async function addServer(serverName, serverConfig) {
   await ipcRenderer.invoke('add-server', { serverName, serverConfig });
   await loadConfig();
   renderServers();
+  ipcRenderer.on('server-log-stream', (_event, payload) => receiveServerLogEvent(payload));
 }
 
  async function updateServer(serverName, serverConfig) {
@@ -984,6 +1416,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadConfig();
   renderServers();
 
+  // The preload exposes only read-only, Tiled-specific IPC calls. It is used
+  // by the bundled Tiled page; ordinary server webviews do not call it.
+  const webview = document.getElementById('server-webview');
+  webview.setAttribute('preload', pathToFileURL(path.join(__dirname, 'tiled-webview-preload.js')).toString());
+
   // Set up event listeners
   document.getElementById('add-server-btn').addEventListener('click', () => openServerModal());
   document.querySelector('.modal .close').addEventListener('click', closeServerModal);
@@ -1013,6 +1450,41 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.querySelector('.close-log').addEventListener('click', closeLogModal);
+  document.getElementById('ssh-password-form').addEventListener('submit', event => {
+    event.preventDefault();
+    finishSshPasswordPrompt(document.getElementById('ssh-password-input').value);
+  });
+  document.querySelector('.close-ssh-password').addEventListener('click', () => finishSshPasswordPrompt());
+  document.getElementById('ssh-password-cancel').addEventListener('click', () => finishSshPasswordPrompt());
+
+  document.getElementById('all-logs-search').addEventListener('input', renderAllLogs);
+  document.getElementById('all-logs-pause').addEventListener('click', () => {
+    allLogsPaused = !allLogsPaused;
+    document.getElementById('all-logs-pause').textContent = allLogsPaused ? 'Resume' : 'Pause';
+    if (allLogsPaused) {
+      clearTimeout(allLogsRenderTimer);
+      allLogsRenderTimer = null;
+      updateAllLogsStreamSummary();
+    } else {
+      renderAllLogs();
+      updateAllLogsStreamSummary();
+    }
+  });
+  document.getElementById('all-logs-refresh').addEventListener('click', () => {
+    renderAllLogs();
+    updateAllLogsStreamSummary();
+  });
+  document.getElementById('all-logs-clear').addEventListener('click', () => {
+    mergedLogEntries = [];
+    renderAllLogs();
+    updateAllLogsStatus(allLogsPaused ? 'Paused — history cleared' : 'History cleared');
+  });
+  document.getElementById('all-logs-autoscroll').addEventListener('change', event => {
+    if (event.target.checked) {
+      const output = document.getElementById('all-logs-output');
+      output.scrollTop = output.scrollHeight;
+    }
+  });
 
   document.querySelector('.close-terminal').addEventListener('click', closeTerminalModal);
 
@@ -1026,8 +1498,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const termModal = document.getElementById('terminal-modal');
 
     const logModal = document.getElementById('log-modal');
+    const passwordModal = document.getElementById('ssh-password-modal');
     if (event.target == logModal) {
       logModal.style.display = 'none';
+    }
+    if (event.target == passwordModal) {
+      finishSshPasswordPrompt();
     }
     if (event.target == termModal) {
       closeTerminalModal();
