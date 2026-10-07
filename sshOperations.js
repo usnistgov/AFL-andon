@@ -3,9 +3,15 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const { createLogger } = require('./logger');
+const { loadTiledProfile } = require('./tiled/profile');
+const { appendAflTiledConfig, updateAflTiledConfig } = require('./aflGlobalConfig');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
+const SUDO_PROMPT = '__AFL_ANDON_SUDO_PASSWORD__';
+const COMPOSE_ALREADY_RUNNING = '__AFL_ANDON_ALREADY_RUNNING__';
+const COMPOSE_PROJECT_MISSING = '__AFL_ANDON_PROJECT_MISSING__';
+const COMPOSE_SERVICE_MISSING = '__AFL_ANDON_SERVICE_MISSING__';
 
 // Common SSH key filenames in order of preference (modern/secure first)
 // Based on OpenSSH default identity file search order
@@ -22,6 +28,14 @@ const sleep = (milliseconds) => new Promise(resolve => setTimeout(resolve, milli
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function isLocalHost(host) {
+  const normalized = String(host || '').trim().toLowerCase();
+  return normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '[::1]';
 }
 
 // `screen -ls` retains exited sessions until `screen -wipe` is run. Keep
@@ -42,15 +56,21 @@ function parseScreenSessions(output) {
 }
 
 class SSHOperations {
-  constructor(configPath, sshKeyPath) {
+  constructor(configPath, sshKeyPath, options = {}) {
     this.config = {};
     this.sshKeyPath = sshKeyPath;
     this.sshKey = null;
     this.sshKeys = [];
     this.preferredSSHKeyPaths = {};
+    // Passwords are intentionally process-local and are never serialized.
+    this.sessionPasswords = new Map();
+    this.createSSHClient = options.clientFactory || (() => new Client());
+    const aflHome = process.env.AFL_HOME?.trim() || path.join(os.homedir(), '.afl');
+    this.aflGlobalConfigPath = options.aflGlobalConfigPath || path.join(aflHome, 'config.json');
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
+    this.activeTiledConnection = null;
     log.debug(`SSHOperations created with configPath=${configPath}, sshKeyPath=${sshKeyPath}`);
   }
 
@@ -91,6 +111,30 @@ class SSHOperations {
           server.username = os.userInfo().username;
         }
       });
+
+      for (const [serverName, server] of Object.entries(this.config)) {
+        if (server.server_type !== 'tiled' || !server.config_file_location) continue;
+        try {
+          const profile = await loadTiledProfile(server.config_file_location, { loadApiKey: false });
+          server.external_service = profile.mode === 'external';
+          server.tiled_management = profile.management;
+          if (server.external_service) {
+            server.tiled_profile_uri = profile.uri;
+            server.tiled_catalog_path = profile.catalogPath || server.tiled_catalog_path;
+            if (profile.management.type === 'docker_compose') {
+              server.host = profile.management.host;
+              server.username = profile.management.username;
+              const endpoint = new URL(profile.uri);
+              server.httpPort = Number(endpoint.port) || (endpoint.protocol === 'https:' ? 443 : 80);
+            }
+            log.info(`${serverName}: Loaded ${profile.management.type} Tiled profile ${server.config_file_location}`);
+          } else {
+            delete server.tiled_profile_uri;
+          }
+        } catch (error) {
+          log.warn(`${serverName}: Could not inspect Tiled profile: ${error.message}`);
+        }
+      }
     } catch (error) {
       log.error(`Failed to load config from ${this.configPath}:`, error.message);
       if (error.code === 'ENOENT') {
@@ -203,9 +247,79 @@ class SSHOperations {
       /authentication methods failed|all configured authentication methods failed|permission denied/i.test(error.message || '');
   }
 
+  getCredentialId(serverName) {
+    const server = this.config[serverName];
+    return server ? `${server.username}@${server.host}` : '';
+  }
+
+  setSessionPassword(serverName, password) {
+    const credentialId = this.getCredentialId(serverName);
+    if (!credentialId) throw new Error(`Server not found: ${serverName}`);
+    if (typeof password !== 'string' || !password) throw new Error('SSH password is required.');
+    this.sessionPasswords.set(credentialId, password);
+  }
+
+  hasSessionPassword(serverName) {
+    const credentialId = this.getCredentialId(serverName);
+    return Boolean(credentialId && this.sessionPasswords.get(credentialId));
+  }
+
+  getSessionPassword(serverName) {
+    return this.sessionPasswords.get(this.getCredentialId(serverName)) || '';
+  }
+
+  clearSessionPassword(serverName) {
+    const credentialId = this.getCredentialId(serverName);
+    if (credentialId) this.sessionPasswords.delete(credentialId);
+  }
+
+  connectWithPassword(serverName, serverConfig, password, timeout = 0, extraOptions = {}) {
+    return new Promise((resolve, reject) => {
+      const conn = this.createSSHClient();
+      let timer;
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        fn(value);
+      };
+
+      conn
+        .on('ready', () => finish(resolve, conn))
+        .on('keyboard-interactive', (_name, _instructions, _language, prompts, reply) => {
+          // Synology DSM commonly exposes password login through SSH's
+          // keyboard-interactive method. OpenSSH handles this automatically,
+          // while ssh2 requires the client to answer the prompts explicitly.
+          log.debug(`${serverName}: Answering ${prompts.length} keyboard-interactive SSH prompt(s)`);
+          reply(prompts.map(() => password));
+        })
+        .on('error', error => {
+          try { conn.end(); } catch (_) { /* Connection already closed. */ }
+          finish(reject, error);
+        });
+      conn.connect({
+        host: serverConfig.host,
+        port: serverConfig.sshPort || 22,
+        username: serverConfig.username,
+        password,
+        tryKeyboard: true,
+        ...extraOptions
+      });
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          const error = new Error(`SSH connection timed out after ${timeout}ms`);
+          error.code = 'ETIMEDOUT';
+          conn.destroy();
+          finish(reject, error);
+        }, timeout);
+      }
+    });
+  }
+
   connectWithKey(serverName, serverConfig, authKey, timeout = 0, extraOptions = {}) {
     return new Promise((resolve, reject) => {
-      const conn = new Client();
+      const conn = this.createSSHClient();
       let timer;
       let settled = false;
       const cleanup = () => {
@@ -239,7 +353,7 @@ class SSHOperations {
       log.debug(`${serverName}: Trying SSH key ${authKey.path}`);
       conn.connect({
         host: serverConfig.host,
-        port: 22,
+        port: serverConfig.sshPort || 22,
         username: serverConfig.username,
         privateKey: authKey.key,
         ...extraOptions
@@ -263,10 +377,29 @@ class SSHOperations {
       throw new Error(`Server not found: ${serverName}`);
     }
 
-    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
-    if (authKeys.length === 0) {
-      throw new Error('No SSH key loaded');
+    const credentialId = this.getCredentialId(serverName);
+    const password = this.sessionPasswords.get(credentialId);
+    if (password) {
+      try {
+        const conn = await this.connectWithPassword(serverName, serverConfig, password, timeout, extraOptions);
+        return { conn, authentication: 'password' };
+      } catch (error) {
+        if (!this.isAuthenticationError(error)) throw error;
+        this.sessionPasswords.delete(credentialId);
+        const authenticationError = new Error(`SSH password authentication failed for ${credentialId}.`);
+        authenticationError.code = 'SSH_AUTHENTICATION_REQUIRED';
+        throw authenticationError;
+      }
     }
+
+    if (serverConfig.tiled_management?.authentication === 'password') {
+      const authenticationError = new Error(`SSH password required for ${credentialId}.`);
+      authenticationError.code = 'SSH_AUTHENTICATION_REQUIRED';
+      throw authenticationError;
+    }
+
+    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
+    if (authKeys.length === 0) throw new Error('No SSH key or session password is available');
 
     let lastError = null;
     for (const authKey of authKeys) {
@@ -323,16 +456,22 @@ class SSHOperations {
     }
   }
 
-  async executeCommand(serverName, command, timeout = 0) {
+  async executeCommand(serverName, command, timeout = 0, options = {}) {
     const serverConfig = this.config[serverName];
     if (!serverConfig) {
       log.error(`No config found for server: ${serverName}`);
       return { success: false, sshDown: true };
     }
 
-    if (this.getAvailableSSHKeys().length === 0) {
-      log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
-      return { success: false, sshDown: true, error: 'No SSH key loaded' };
+    if (this.getAvailableSSHKeys().length === 0 && !this.hasSessionPassword(serverName)) {
+      const passwordRequired = serverConfig.tiled_management?.authentication === 'password';
+      if (!options.quiet) log.error(`No SSH credential available for ${serverName}`);
+      return {
+        success: false,
+        sshDown: !passwordRequired,
+        authenticationRequired: passwordRequired,
+        error: passwordRequired ? 'SSH password required' : 'No SSH credential available'
+      };
     }
 
     log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
@@ -341,21 +480,28 @@ class SSHOperations {
     try {
       ({ conn } = await this.connectWithAvailableKeys(serverName, timeout));
     } catch (error) {
-      log.error(`${serverName}: SSH connection error:`, error.message);
+      if (!options.quiet) log.error(`${serverName}: SSH connection error:`, error.message);
       if (error.level) {
         log.debug(`${serverName}: Error level: ${error.level}`);
       }
-      return { success: false, sshDown: true, error: error.message };
+      return {
+        success: false,
+        sshDown: error.code !== 'SSH_AUTHENTICATION_REQUIRED',
+        authenticationRequired: error.code === 'SSH_AUTHENTICATION_REQUIRED',
+        error: error.message
+      };
     }
 
     return new Promise((resolve) => {
-      conn.exec(command, (err, stream) => {
+      const onExec = (err, stream) => {
         if (err) {
-          log.error(`${serverName}: Command execution failed:`, err.message);
+          if (!options.quiet) log.error(`${serverName}: Command execution failed:`, err.message);
           conn.end();
           resolve({ success: false, sshDown: true, error: err.message });
           return;
         }
+
+        if (options.stdin) stream.end(options.stdin);
 
         let output = '';
         stream.on('close', (code, signal) => {
@@ -363,7 +509,7 @@ class SSHOperations {
           log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
           // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
           const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
-          if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+          if (code !== 0 && code !== null && !isScreenLsNoScreens && !options.quiet) {
             log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
           resolve({ success: true, output, code, signal });
@@ -374,7 +520,9 @@ class SSHOperations {
           output += data;
           log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
         });
-      });
+      };
+      if (options.pty) conn.exec(command, { pty: true }, onExec);
+      else conn.exec(command, onExec);
     });
   }
 
@@ -429,7 +577,45 @@ class SSHOperations {
       `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
   }
 
+  getTiledApiBaseUrl(serverName, profile) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+
+    // Native Tiled service profiles intentionally have no `uri`. The
+    // webview URL is only for people and may contain /ui/browse plus an API
+    // key, so it must never be handed to AFL drivers as their API endpoint.
+    const endpoint = profile?.uri ||
+      `http://${serverConfig.host}:${serverConfig.httpPort || 8000}/`;
+    return new URL('/', endpoint).toString();
+  }
+
   async probeServerHealth(serverName) {
+    const serverConfig = this.config[serverName];
+    if (serverConfig?.server_type === 'tiled') {
+      let timer;
+      try {
+        const profile = await loadTiledProfile(serverConfig.config_file_location);
+        const baseUrl = this.getTiledApiBaseUrl(serverName, profile);
+        const url = new URL('api/v1/metadata/', baseUrl).toString();
+        const controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), 3000);
+        const response = await fetch(url, {
+          headers: {
+            Accept: 'application/vnd.api+json, application/json',
+            ...(profile.apiKey ? { Authorization: `Apikey ${profile.apiKey}` } : {})
+          },
+          signal: controller.signal
+        });
+        return response.ok
+          ? { ok: true, url, statusCode: response.status }
+          : { ok: false, url, statusCode: response.status, reason: `HTTP ${response.status}` };
+      } catch (error) {
+        return { ok: false, url: serverConfig.tiled_profile_uri || serverConfig.webview_url, reason: error.message };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     const url = this.getStatusUrl(serverName);
     const command = `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(url)}`;
     const result = await this.executeCommand(serverName, command, 5000);
@@ -458,26 +644,374 @@ class SSHOperations {
     return lastResult;
   }
 
+  async activateTiledForSession(serverName) {
+    const serverConfig = this.config[serverName];
+    if (serverConfig?.server_type !== 'tiled') return null;
+
+    const profile = await loadTiledProfile(serverConfig.config_file_location);
+    const tiledServer = this.getTiledApiBaseUrl(serverName, profile);
+    const result = await updateAflTiledConfig(
+      this.aflGlobalConfigPath,
+      tiledServer,
+      profile.apiKey
+    );
+    this.activeTiledConnection = {
+      serverName,
+      tiledServer: result.record.tiled_server,
+      tiledApiKey: result.record.tiled_api_key
+    };
+    log.info(`${serverName}: Activated ${result.record.tiled_server} in AFL global config ${this.aflGlobalConfigPath}`);
+    return result;
+  }
+
+  async getRemoteReachableTiledUrl(serverName, tiledServer) {
+    const url = new URL(tiledServer);
+    if (!isLocalHost(url.hostname)) return url.toString().replace(/\/$/, '');
+
+    const connection = await this.executeCommand(
+      serverName,
+      `printf '%s\\n' "$SSH_CONNECTION"`,
+      5000,
+      { quiet: true }
+    );
+    if (!connection.success || (connection.code !== 0 && connection.code !== null)) {
+      throw new Error(connection.error || 'could not determine the workstation address from SSH');
+    }
+    const clientAddress = String(connection.output || '').trim().split(/\s+/)[0];
+    if (!clientAddress) {
+      throw new Error('the remote SSH session did not report a workstation address');
+    }
+    url.hostname = clientAddress.includes(':') ? `[${clientAddress}]` : clientAddress;
+    return url.toString().replace(/\/$/, '');
+  }
+
+  async discoverActiveTiledConnection() {
+    if (this.activeTiledConnection) return this.activeTiledConnection;
+
+    const tiledServers = Object.keys(this.config).filter(name =>
+      this.config[name]?.server_type === 'tiled' && this.config[name]?.active !== false
+    );
+    for (const tiledServerName of tiledServers) {
+      const health = await this.probeServerHealth(tiledServerName);
+      if (!health.ok) continue;
+      try {
+        await this.activateTiledForSession(tiledServerName);
+        return this.activeTiledConnection;
+      } catch (error) {
+        log.warn(`${tiledServerName}: Could not activate reachable Tiled service for drivers: ${error.message}`);
+      }
+    }
+    return null;
+  }
+
+  async probeTiledFromDriverHost(serverName, tiledServer, tiledApiKey) {
+    const metadataUrl = new URL('api/v1/metadata/', `${tiledServer.replace(/\/$/, '')}/`).toString();
+    const authenticated = Boolean(String(tiledApiKey || '').trim());
+    const command = authenticated
+      ? `IFS= read -r TILED_API_KEY; curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 --header "Authorization: Apikey $TILED_API_KEY" ${shellQuote(metadataUrl)}`
+      : `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(metadataUrl)}`;
+    const result = await this.executeCommand(
+      serverName,
+      command,
+      5000,
+      { quiet: true, ...(authenticated ? { stdin: `${tiledApiKey}\n` } : {}) }
+    );
+    const statusCode = String(result.output || '').trim().match(/\d{3}$/)?.[0];
+    if (!result.success || result.code !== 0 || !statusCode || Number(statusCode) < 200 || Number(statusCode) >= 300) {
+      return {
+        success: false,
+        error: result.error || (statusCode
+          ? `Tiled returned HTTP ${statusCode}`
+          : 'Tiled did not return an HTTP status')
+      };
+    }
+    return { success: true, metadataUrl, statusCode: Number(statusCode) };
+  }
+
+  async syncActiveTiledConfigForDriver(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig?.server_module) return { success: true, skipped: true };
+
+    const active = await this.discoverActiveTiledConnection();
+    if (!active) {
+      log.info(`${serverName}: Tiled connection was not initiated; no active Tiled service was found`);
+      return { success: true, skipped: true };
+    }
+
+    let tiledServer = active.tiledServer;
+    try {
+      if (!isLocalHost(serverConfig.host)) {
+        tiledServer = await this.getRemoteReachableTiledUrl(serverName, active.tiledServer);
+      }
+    } catch (error) {
+      const message = `Tiled connection failed before launch; address ${active.tiledServer}: could not resolve it for ${serverConfig.host}: ${error.message}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer: active.tiledServer };
+    }
+
+    const reachable = await this.probeTiledFromDriverHost(serverName, tiledServer, active.tiledApiKey);
+    if (!reachable.success) {
+      const message = `Tiled connection failed before launch; address ${tiledServer}: ${reachable.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer };
+    }
+
+    if (isLocalHost(serverConfig.host)) {
+      log.info(`${serverName}: Tiled connectivity verified before launch at ${tiledServer}`);
+      return { success: true, tiledServer, verified: true };
+    }
+
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
+    const remotePath = `${homePath}/.afl/config.json`;
+    const existing = await this.readRemoteFile(serverConfig.host, remotePath);
+    let config = {};
+    if (existing.success) {
+      try {
+        config = JSON.parse(existing.data);
+      } catch (error) {
+        return { success: false, error: `Remote AFL global config ${remotePath} is invalid JSON: ${error.message}` };
+      }
+    } else if (!/no such file|enoent/i.test(existing.error || '')) {
+      return { success: false, error: `Could not read remote AFL global config ${remotePath}: ${existing.error}` };
+    }
+
+    let updated;
+    try {
+      updated = appendAflTiledConfig(config, tiledServer, active.tiledApiKey);
+    } catch (error) {
+      return { success: false, error: `Could not update remote AFL global config ${remotePath}: ${error.message}` };
+    }
+    const written = await this.writeRemoteFile(
+      serverConfig.host,
+      remotePath,
+      `${JSON.stringify(updated.config, null, 4)}\n`
+    );
+    if (!written.success) {
+      const message = `Tiled connection configuration failed for ${tiledServer}: could not write ${remotePath}: ${written.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer };
+    }
+
+    log.info(`${serverName}: Activated ${updated.record.tiled_server} in remote AFL global config ${remotePath}`);
+    log.info(`${serverName}: Tiled connectivity verified before launch at ${updated.record.tiled_server}`);
+    return { success: true, tiledServer: updated.record.tiled_server, remotePath, verified: true };
+  }
+
   async ensureScreenDetached(serverName) {
     const screenName = this.config[serverName].screen_name;
-    // startServer already launches screen with -d -m.  Asking screen to
-    // detach it again fails when it is already detached, so only verify it.
-    const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
-    if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
-    const session = parseScreenSessions(statusResult.output)
-      .find(item => item.name === screenName && item.state !== 'dead');
+    const getSession = async () => {
+      const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
+      if (!statusResult.success) {
+        return { error: statusResult.error || 'could not verify screen state' };
+      }
+      return {
+        session: parseScreenSessions(statusResult.output)
+          .find(item => item.name === screenName && item.state !== 'dead')
+      };
+    };
+
+    let { session, error } = await getSession();
+    if (error) return { ok: false, reason: error };
     if (!session) return { ok: false, reason: `screen session "${screenName}" exited` };
+    if (session.state === 'detached') return { ok: true };
+
+    if (session.state !== 'attached') {
+      return { ok: false, reason: `screen session is ${session.state}, not detached` };
+    }
+
+    // A user may have joined the session while the server was starting.  Send
+    // the screen command only in that case: `screen -X detach` errors for an
+    // already-detached session.
+    const detachResult = await this.executeCommand(
+      serverName,
+      `screen -S ${shellQuote(screenName)} -X detach`,
+      5000
+    );
+    if (!detachResult.success || (detachResult.code !== 0 && detachResult.code !== null)) {
+      return {
+        ok: false,
+        reason: detachResult.error || `screen detach command exited with code ${detachResult.code}`
+      };
+    }
+
+    ({ session, error } = await getSession());
+    if (error) return { ok: false, reason: error };
+    if (!session) return { ok: false, reason: `screen session "${screenName}" exited while detaching` };
     if (session.state !== 'detached') return { ok: false, reason: `screen session is ${session.state}, not detached` };
     return { ok: true };
   }
 
-  async startServer(serverName) {
+  async resolveModuleConfigPath(serverName, serverConfig) {
+    const localPath = serverConfig.config_file_location?.trim();
+    if (!localPath) return { success: true, configPath: null };
+
+    let content;
+    try {
+      content = await fs.readFile(localPath, 'utf8');
+    } catch (error) {
+      const message = error.code === 'ENOENT'
+        ? `Config file does not exist on this computer: ${localPath}`
+        : `Could not read config file ${localPath}: ${error.message}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+    log.info(`${serverName}: Read launcher config file from ${localPath} (${Buffer.byteLength(content, 'utf8')} bytes)`);
+
+    if (isLocalHost(serverConfig.host)) {
+      log.debug(`${serverName}: Using local config file ${localPath}`);
+      return { success: true, configPath: localPath };
+    }
+
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
+    const extension = path.extname(localPath);
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const remotePath = `${homePath}/.afl/configs/${safeServerName}.launch-config${extension}`;
+    const upload = await this.writeRemoteFile(serverConfig.host, remotePath, content);
+    if (!upload.success) {
+      const message = `Could not copy config file to ${serverConfig.host}: ${upload.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+
+    log.info(`${serverName}: Copied local config file to ${remotePath}`);
+    return { success: true, configPath: remotePath };
+  }
+
+  isDockerComposeManaged(serverConfig) {
+    return serverConfig?.server_type === 'tiled' &&
+      serverConfig?.tiled_management?.type === 'docker_compose';
+  }
+
+  getDockerComposeCommand(serverConfig, args) {
+    const management = serverConfig.tiled_management;
+    return `cd ${shellQuote(management.projectDirectory)} && docker compose ${args}`;
+  }
+
+  getSudoDockerComposeCommand(serverConfig, args, prompt = '') {
+    const command = this.getDockerComposeCommand(serverConfig, args);
+    return `sudo -S -p ${shellQuote(prompt)} -i sh -lc ${shellQuote(command)}`;
+  }
+
+  getSudoPrompt() {
+    return SUDO_PROMPT;
+  }
+
+  executeDockerComposeCommand(serverName, args, timeout = 0, options = {}) {
+    const serverConfig = this.config[serverName];
+    const password = this.getSessionPassword(serverName);
+    if (!password) {
+      return Promise.resolve({
+        success: false,
+        authenticationRequired: true,
+        error: 'A password is required for sudo on the NAS.'
+      });
+    }
+    return this.executeCommand(
+      serverName,
+      this.getSudoDockerComposeCommand(serverConfig, args),
+      timeout,
+      { ...options, stdin: `${password}\n` }
+    );
+  }
+
+  getDockerComposeStartCommand(serverConfig) {
+    const management = serverConfig.tiled_management;
+    const directory = shellQuote(management.projectDirectory);
+    const service = shellQuote(management.service);
+    return [
+      `if ! test -d ${directory}; then printf '%s\\n' '${COMPOSE_PROJECT_MISSING}'; exit 40; fi`,
+      `cd ${directory} || exit 40`,
+      `if ! docker compose config --services | grep -Fx -- ${service} >/dev/null; then printf '%s\\n' '${COMPOSE_SERVICE_MISSING}'; exit 41; fi`,
+      `if [ -n "$(docker compose ps --status running --quiet ${service})" ]; then printf '%s\\n' '${COMPOSE_ALREADY_RUNNING}'; else docker compose up -d ${service}; fi`
+    ].join('; ');
+  }
+
+  getJoinCommand(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    if (this.isDockerComposeManaged(serverConfig)) {
+      const management = serverConfig.tiled_management;
+      return this.getSudoDockerComposeCommand(
+        serverConfig,
+        `exec ${shellQuote(management.service)} ${shellQuote(management.joinShell)}`,
+        SUDO_PROMPT
+      );
+    }
+    return `screen -x ${shellQuote(serverConfig.screen_name)}`;
+  }
+
+  async startServer(serverName, options = {}) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
     
     if (!serverConfig) {
       log.error(`Cannot start server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      let launchContext;
+      if (typeof options.onBeforeLaunch === 'function') launchContext = await options.onBeforeLaunch();
+      const password = this.getSessionPassword(serverName);
+      if (!password) {
+        return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+      }
+      const result = await this.executeCommand(
+        serverName,
+        `sudo -S -p '' -i sh -lc ${shellQuote(this.getDockerComposeStartCommand(serverConfig))}`,
+        0,
+        { stdin: `${password}\n` }
+      );
+      if (!result.success || (result.code !== 0 && result.code !== null)) {
+        let error = result.error || `Docker Compose validation/start exited with code ${result.code}`;
+        if (String(result.output || '').includes(COMPOSE_PROJECT_MISSING)) {
+          error = `Docker Compose project directory does not exist: ${serverConfig.tiled_management.projectDirectory}`;
+        } else if (String(result.output || '').includes(COMPOSE_SERVICE_MISSING)) {
+          error = `Docker Compose service "${serverConfig.tiled_management.service}" is not declared in ${serverConfig.tiled_management.projectDirectory}`;
+        }
+        return { ...result, success: false, error };
+      }
+      if (typeof options.onLaunched === 'function') await options.onLaunched(launchContext);
+      const health = await this.waitForServerHealth(
+        serverName,
+        serverConfig.health_check_attempts || 20,
+        serverConfig.health_check_interval_ms || 1000
+      );
+      if (!health.ok) {
+        const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
+        return { success: false, error: `Container started but Tiled is not reachable at ${health.url}: ${reason}`, health };
+      }
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled is running, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
+      return {
+        ...result,
+        alreadyRunning: String(result.output || '').includes(COMPOSE_ALREADY_RUNNING),
+        health
+      };
+    }
+    if (serverConfig.external_service) {
+      return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
+    }
+
+    let launchConfigPath = null;
+    if (serverConfig.server_module || serverConfig.server_type === 'tiled') {
+      const configResult = await this.resolveModuleConfigPath(serverName, serverConfig);
+      if (!configResult.success) return configResult;
+      launchConfigPath = configResult.configPath;
+    }
+
+    if (serverConfig.server_module) {
+      const tiledConfig = await this.syncActiveTiledConfigForDriver(serverName);
+      if (!tiledConfig.success) {
+        const error = `Driver was not launched because its Tiled configuration could not be synchronized: ${tiledConfig.error}`;
+        log.error(`${serverName}: ${error}`);
+        return {
+          success: false,
+          error
+        };
+      }
     }
     
     // Detect remote OS to use appropriate screen options
@@ -503,7 +1037,19 @@ class SSHOperations {
     }
 
     if (serverConfig.server_module) {
-      let command = `python -m ${serverConfig.server_module}`;
+      const httpPort = Number(serverConfig.httpPort);
+      if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
+        return {
+          success: false,
+          error: `Invalid HTTP port for ${serverName}: ${serverConfig.httpPort}`
+        };
+      }
+      let command = `python -m ${serverConfig.server_module} --port ${httpPort}`;
+      if (launchConfigPath) {
+        command += ` --config ${shellQuote(launchConfigPath)}`;
+        log.info(`${serverName}: Launching server with provided config file ${launchConfigPath}`);
+        log.debug(`${serverName}: Using config file ${launchConfigPath}`);
+      }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
       
       // Handle environment activation based on env_type
@@ -520,7 +1066,25 @@ class SSHOperations {
         command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
       }
       
-      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci "${command}"`;
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci ${shellQuote(command)}`;
+    } else if (serverConfig.server_type === 'tiled') {
+      if (!launchConfigPath) {
+        return { success: false, error: 'Tiled requires a config file location.' };
+      }
+      // Tiled config files commonly use relative catalog/storage paths. Match
+      // tiled/start_tiled.sh by serving from the config file's directory.
+      const tiledConfigDirectory = path.dirname(launchConfigPath);
+      let command = `cd ${shellQuote(tiledConfigDirectory)} && tiled serve config ${shellQuote(launchConfigPath)}`;
+      // Keep the start path consistent with tiled/start_tiled.sh.
+      if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
+        command = `source ${shellQuote(path.join(serverConfig.virtualenv_path, 'bin', 'activate'))};${command}`;
+      } else {
+        command = `conda activate ${shellQuote(serverConfig.conda_env || 'afl_agent')};${command}`;
+      }
+      if (isMacOs) {
+        command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
+      }
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell || 'bash'} -ci ${shellQuote(command)}`;
     } else if (serverConfig.server_script) {
       log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
       if (isMacOs) {
@@ -532,6 +1096,11 @@ class SSHOperations {
     } else {
       log.error(`${serverName}: Neither server_module nor server_script specified`);
       return { success: false, error: 'Neither server_module nor server_script specified in config' };
+    }
+
+    let launchContext;
+    if (typeof options.onBeforeLaunch === 'function') {
+      launchContext = await options.onBeforeLaunch();
     }
 
     log.info(`${serverName}: Executing start command`);
@@ -556,6 +1125,28 @@ class SSHOperations {
       }
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
     }
+
+    // GNU Screen buffers logfile output for 10 seconds by default. Reduce the
+    // flush interval so the combined logs view closely follows server output.
+    if (!isMacOs) {
+      const flushResult = await this.executeCommand(
+        serverName,
+        `screen -S ${shellQuote(serverConfig.screen_name)} -X logfile flush 1`,
+        5000
+      );
+      if (!flushResult.success || (flushResult.code !== 0 && flushResult.code !== null)) {
+        const error = flushResult.error || `command exited with code ${flushResult.code}`;
+        log.warn(`${serverName}: Could not set Screen logfile flush interval to 1 second: ${error}`);
+      } else {
+        log.debug(`${serverName}: Set Screen logfile flush interval to 1 second`);
+      }
+    }
+
+    // The screen and its logfile now exist. Start observers before health
+    // checks so startup output is not lost while waiting for HTTP readiness.
+    if (typeof options.onLaunched === 'function') {
+      await options.onLaunched(launchContext);
+    }
     
     const health = await this.waitForServerHealth(
       serverName,
@@ -564,9 +1155,38 @@ class SSHOperations {
     );
     if (!health.ok) {
       const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
-      const error = `Server started but is not reachable at ${health.url}: ${reason}`;
-      log.error(`${serverName}: ${error}`);
-      return { success: false, error, health };
+      const warning = `Server process started but HTTP is not reachable at ${health.url}: ${reason}`;
+      const detached = await this.ensureScreenDetached(serverName);
+      if (!detached.ok) {
+        const error = `${warning}; screen session is unavailable: ${detached.reason}`;
+        log.error(`${serverName}: ${error}`);
+        return { success: false, error, health };
+      }
+
+      // Some AFL drivers intentionally continue without a Tiled backend after
+      // their own connection retries. A live Screen session is therefore a
+      // successful (but degraded) launch even if HTTP is not ready yet.
+      const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'running');
+      const runtimeWarning = runtimeConfig.success
+        ? warning
+        : `${warning}; Andon runtime config was not updated: ${runtimeConfig.error || 'unknown error'}`;
+      log.warn(`${serverName}: ${runtimeWarning}`);
+      return {
+        ...result,
+        success: true,
+        degraded: true,
+        warning: runtimeWarning,
+        health,
+        screenState: 'detached'
+      };
+    }
+
+    if (serverConfig.server_type === 'tiled') {
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled is running, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
     }
 
     const detached = await this.ensureScreenDetached(serverName);
@@ -583,7 +1203,7 @@ class SSHOperations {
       return { success: false, error, health };
     }
 
-    log.info(`${serverName}: Server started, passed health check, and is detached`);
+    log.info(`${serverName}: Server started, passed health check, and screen session is active`);
     return { ...result, health };
   }
 
@@ -594,6 +1214,21 @@ class SSHOperations {
     if (!serverConfig) {
       log.error(`Cannot stop server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      // A NAS-hosted Tiled service is shared infrastructure. Stop means
+      // disconnect this Andon session; it must not stop or alter the remote
+      // Docker Compose service.
+      return {
+        success: true,
+        disconnected: true,
+        status: false,
+        managementType: 'docker_compose',
+        screenState: 'disconnected'
+      };
+    }
+    if (serverConfig.external_service) {
+      return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
     }
     
     // Build a more robust stop command that:
@@ -637,6 +1272,9 @@ class SSHOperations {
     
     if (result.success) {
       log.info(`${serverName}: Server stopped successfully`);
+      if (serverConfig.server_type === 'tiled' && this.activeTiledConnection?.serverName === serverName) {
+        this.activeTiledConnection = null;
+      }
       const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
       if (!runtimeConfig.success) {
         log.error(`${serverName}: Andon runtime config could not be updated after stop: ${runtimeConfig.error || 'unknown error'}`);
@@ -649,8 +1287,33 @@ class SSHOperations {
     return result;
   }
 
-  async restartServer(serverName) {
+  async restartServer(serverName, options = {}) {
     log.info(`Restarting server: ${serverName}`);
+    const serverConfig = this.config[serverName];
+    if (this.isDockerComposeManaged(serverConfig)) {
+      let launchContext;
+      if (typeof options.onBeforeLaunch === 'function') launchContext = await options.onBeforeLaunch();
+      const management = serverConfig.tiled_management;
+      const result = await this.executeDockerComposeCommand(serverName, `restart ${shellQuote(management.service)}`);
+      if (!result.success || (result.code !== 0 && result.code !== null)) {
+        return { ...result, success: false, error: result.error || `Docker Compose restart exited with code ${result.code}` };
+      }
+      if (typeof options.onLaunched === 'function') await options.onLaunched(launchContext);
+      const health = await this.waitForServerHealth(
+        serverName,
+        serverConfig.health_check_attempts || 20,
+        serverConfig.health_check_interval_ms || 1000
+      );
+      if (!health.ok) {
+        return { success: false, error: `Container restarted but Tiled is not reachable at ${health.url}: ${health.reason || `HTTP ${health.statusCode}`}`, health };
+      }
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled restarted, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
+      return { ...result, health };
+    }
     const stopResult = await this.stopServer(serverName);
     if (!stopResult.success && !stopResult.sshDown) {
       log.error(`${serverName}: Stop failed during restart`);
@@ -658,7 +1321,7 @@ class SSHOperations {
     }
     
     log.debug(`${serverName}: Stop complete, starting server`);
-    const startResult = await this.startServer(serverName);
+    const startResult = await this.startServer(serverName, options);
     
     if (startResult.success) {
       log.info(`${serverName}: Server restarted successfully`);
@@ -673,6 +1336,38 @@ class SSHOperations {
     if (!serverConfig) {
       log.error(`Cannot get status: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      if (serverConfig.tiled_management.authentication === 'password' && !this.hasSessionPassword(serverName)) {
+        return {
+          success: false,
+          status: false,
+          authenticationRequired: true,
+          managementType: 'docker_compose',
+          screenState: 'unknown'
+        };
+      }
+      const management = serverConfig.tiled_management;
+      const result = await this.executeDockerComposeCommand(
+        serverName,
+        `ps --status running --quiet ${shellQuote(management.service)}`,
+        5000,
+        { quiet: true }
+      );
+      if (!result.success) {
+        return {
+          success: false,
+          sshDown: !!result.sshDown,
+          authenticationRequired: !!result.authenticationRequired,
+          managementType: 'docker_compose',
+          error: result.error
+        };
+      }
+      const running = (result.code === 0 || result.code === null) && Boolean(String(result.output || '').trim());
+      return { success: true, status: running, managementType: 'docker_compose', screenState: running ? 'running' : 'missing' };
+    }
+    if (serverConfig.external_service) {
+      return { success: true, status: true, external: true, screenState: 'external' };
     }
 
     log.debug(`${serverName}: Checking status on ${serverConfig.host}`);
@@ -694,10 +1389,10 @@ class SSHOperations {
     }
     
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
 
     if (!result.success) {
-      log.warn(`${serverName}: Failed to get status - SSH down`);
+      log.debug(`${serverName}: Failed to get status - SSH down`);
       return { success: false, sshDown: true };
     }
     
@@ -745,10 +1440,10 @@ class SSHOperations {
     
     log.debug(`Batch status check for host ${host} using ${serverName}`);
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
     
     if (!result.success) {
-      log.warn(`Batch status check failed for host ${host} - SSH down`);
+      log.debug(`Batch status check failed for host ${host} - SSH down`);
       return { success: false, sshDown: true, host };
     }
     
@@ -779,6 +1474,7 @@ class SSHOperations {
     
     Object.entries(this.config).forEach(([serverName, serverConfig]) => {
       if (!serverConfig.active) return;
+      if (serverConfig.external_service) return;
       
       const host = serverConfig.host;
       if (!hostMap[host]) {
@@ -800,12 +1496,25 @@ class SSHOperations {
       log.error(`Cannot get log: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
     }
+    if (this.isDockerComposeManaged(serverConfig) && !this.hasSessionPassword(serverName)) {
+      return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+    }
     
-    const logPath = path.join('.afl', `${serverConfig.screen_name}.screenlog`);
-    const logCommand = `tail -n ${lines} $\{HOME}/${logPath}`;
+    const logCommand = this.isDockerComposeManaged(serverConfig)
+      ? this.getSudoDockerComposeCommand(
+        serverConfig,
+        `logs --tail=${Number.parseInt(lines, 10) || 200} --no-color ${shellQuote(serverConfig.tiled_management.service)}`
+      )
+      : `tail -n ${lines} $\{HOME}/${path.join('.afl', `${serverConfig.screen_name}.screenlog`)}`;
     log.debug(`${serverName}: Log command: ${logCommand}`);
     
-    const result = await this.executeCommand(serverName, logCommand);
+    const password = this.isDockerComposeManaged(serverConfig) ? this.getSessionPassword(serverName) : '';
+    const result = await this.executeCommand(
+      serverName,
+      logCommand,
+      0,
+      password ? { stdin: `${password}\n` } : {}
+    );
     
     if (result.success) {
       log.debug(`${serverName}: Retrieved ${result.output?.length || 0} bytes of log`);
@@ -814,6 +1523,99 @@ class SSHOperations {
     }
     
     return result;
+  }
+
+  async getServerLogSize(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) return { success: false, error: `Server not found: ${serverName}` };
+    if (this.isDockerComposeManaged(serverConfig)) return { success: true, size: 0 };
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const result = await this.executeCommand(serverName, `wc -c < ${logPath} 2>/dev/null || printf 0`, 10000);
+    if (!result.success) return result;
+    const size = Number.parseInt(String(result.output || '').trim(), 10);
+    return { success: true, size: Number.isSafeInteger(size) && size >= 0 ? size : 0 };
+  }
+
+  async streamServerLog(serverName, startOffset, handlers = {}) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    const dockerCompose = this.isDockerComposeManaged(serverConfig);
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const hasOffset = !dockerCompose && Number.isSafeInteger(startOffset) && startOffset >= 0;
+    const offset = hasOffset ? startOffset : 0;
+    const command = dockerCompose
+      ? this.getSudoDockerComposeCommand(
+        serverConfig,
+        `logs --follow --tail=0 --no-color ${shellQuote(serverConfig.tiled_management.service)}`
+      )
+      : (hasOffset ? `tail -c +${offset + 1} -F ${logPath}` : `tail -n 0 -F ${logPath}`);
+
+    const { conn } = await this.connectWithAvailableKeys(serverName, 10000, {
+      keepaliveInterval: 10000,
+      keepaliveCountMax: 3
+    });
+
+    return new Promise((resolve, reject) => {
+      let channel;
+      let intentionalClose = false;
+      let closed = false;
+      const controller = {
+        offset: hasOffset ? offset : null,
+        close() {
+          intentionalClose = true;
+          try { channel?.close(); } catch (_) { /* Already closed. */ }
+          try { conn.end(); } catch (_) { /* Already closed. */ }
+        }
+      };
+      const reportClose = (error = null) => {
+        if (closed) return;
+        closed = true;
+        if (!intentionalClose) handlers.onClose?.(error);
+      };
+
+      conn.on('error', error => {
+        if (!intentionalClose) handlers.onError?.(error);
+      });
+      conn.on('close', () => reportClose());
+      conn.exec(command, (error, stream) => {
+        if (error) {
+          conn.end();
+          reject(error);
+          return;
+        }
+        channel = stream;
+        if (dockerCompose) {
+          const password = this.getSessionPassword(serverName);
+          if (!password) {
+            conn.end();
+            reject(new Error('A password is required for sudo on the NAS.'));
+            return;
+          }
+          stream.write(`${password}\n`);
+        }
+        stream.setEncoding('utf8');
+        stream.on('data', data => {
+          if (controller.offset !== null) controller.offset += Buffer.byteLength(data, 'utf8');
+          handlers.onData?.(data);
+        });
+        stream.on('error', streamError => handlers.onError?.(streamError));
+        stream.stderr.on('data', data => {
+          const message = String(data).trim();
+          if (/file truncated/i.test(message)) {
+            controller.offset = 0;
+          } else if (message && !/has appeared; following/i.test(message)) {
+            handlers.onError?.(new Error(message));
+          }
+        });
+        stream.on('close', () => {
+          conn.end();
+          reportClose();
+        });
+        resolve(controller);
+      });
+    });
   }
 
   async joinServer(serverName) {
@@ -825,9 +1627,18 @@ class SSHOperations {
       return { success: false, error: 'Server not found' };
     }
     
-    const joinCommand = `screen -x ${serverConfig.screen_name}`;
+    if (this.isDockerComposeManaged(serverConfig) && !this.hasSessionPassword(serverName)) {
+      return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+    }
+    const joinCommand = this.getJoinCommand(serverName);
     log.debug(`${serverName}: Join command: ${joinCommand}`);
-    return this.executeCommand(serverName, joinCommand);
+    const password = this.isDockerComposeManaged(serverConfig) ? this.getSessionPassword(serverName) : '';
+    return this.executeCommand(
+      serverName,
+      joinCommand,
+      0,
+      password ? { stdin: `${password}\n`, pty: true } : {}
+    );
   }
 
   getServerForHost(host) {
