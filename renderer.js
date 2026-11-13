@@ -1,18 +1,22 @@
 // renderer.js (Renderer process)
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, clipboard } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { pathToFileURL } = require('url');
 const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const JSONEditor = require('jsoneditor');
 const { createLogger, setLogSink } = require('./logger');
 const { serverActivityPresentation } = require('./serverStatus');
+const { getSshAuthentication, getSshCredentialId } = require('./sshAuthentication');
+const { ErrorDialog, inferErrorServers } = require('./errorReporting');
 const {
   MAX_MERGED_LINES,
   decodeLogChunk,
   stripTerminalControl,
   capEntries,
   filterEntries,
+  LogSourceTracker,
   stableServerColor,
   isRoutineHealthLog
 } = require('./allLogs');
@@ -46,7 +50,10 @@ let loadedWebviewServerName = null;
 let inactiveExpanded = false;
 const startedServers = new Set();
 const displayedServerStatuses = new Map();
+const queueHealthWarnings = new Map();
 const allLogServers = new Map();
+const hiddenLogSources = new Set();
+const logSourceTracker = new LogSourceTracker();
 let mergedLogEntries = [];
 let allLogsPaused = false;
 const logChunkRemainders = new Map();
@@ -55,9 +62,23 @@ let lastSessionLogSequence = 0;
 let allLogsSyncTimer = null;
 let allLogsSyncRunning = false;
 let sshPasswordPromptResolve = null;
+const errorDialog = new ErrorDialog(document, clipboard);
+
+// Collect errors and live server output on every tab, including before the
+// asynchronous UI initialization finishes.
+ipcRenderer.on('server-log-stream', (_event, payload) => receiveServerLogEvent(payload));
+window.addEventListener?.('error', event => {
+  errorDialog.report(editingServer || 'Andon', event.error || event.message);
+});
+window.addEventListener?.('unhandledrejection', event => {
+  errorDialog.report(editingServer || 'Andon', event.reason);
+});
 
 setLogSink(({ level, moduleName, text, observedAt }) => {
   if (!['error', 'warn', 'info'].includes(level)) return;
+  if (level === 'error') {
+    for (const serverName of inferErrorServers(text, config)) errorDialog.report(serverName, text, observedAt);
+  }
   const entries = String(text).split(/\r?\n/).map(line => ({
     server: 'Andon',
     text: `[${level.toUpperCase()}] [${moduleName}] ${line}`,
@@ -98,7 +119,7 @@ function finishSshPasswordPrompt(password = null) {
 
 async function ensureSshPassword(serverName, forcePrompt = false) {
   const server = config?.[serverName];
-  if (server?.tiled_management?.authentication !== 'password') return true;
+  if (getSshAuthentication(server) !== 'password') return true;
   if (!forcePrompt) {
     const status = await ipcRenderer.invoke('has-session-ssh-password', serverName);
     if (status.available) return true;
@@ -107,7 +128,7 @@ async function ensureSshPassword(serverName, forcePrompt = false) {
   if (password === null) return false;
   const result = await ipcRenderer.invoke('set-session-ssh-password', serverName, password);
   if (!result.success) {
-    alert(result.error || 'Could not set the SSH password.');
+    errorDialog.report(serverName, result.error || 'Could not set the SSH password.');
     return false;
   }
   return true;
@@ -170,7 +191,7 @@ function renderAllLogs() {
   const keepAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 24;
   const enabled = new Set([...allLogServers].filter(([, state]) => state.enabled).map(([name]) => name));
   const search = document.getElementById('all-logs-search')?.value || '';
-  const entries = filterEntries(mergedLogEntries, enabled, search);
+  const entries = filterEntries(mergedLogEntries, enabled, search, hiddenLogSources);
   const fragment = document.createDocumentFragment();
   if (!entries.length) {
     const empty = document.createElement('div');
@@ -233,25 +254,34 @@ function scheduleAllLogsRender() {
 }
 
 function handleServerLogStream({ serverName, type, data = '', status, error = '', reset = false, observedAt = Date.now(), persisted = false }) {
+  if (type === 'error') {
+    errorDialog.report(serverName, error, observedAt);
+    return;
+  }
   const state = ensureAllLogServer(serverName);
-  if (reset) logChunkRemainders.delete(serverName);
+  if (reset) {
+    logChunkRemainders.delete(serverName);
+    logSourceTracker.reset(serverName);
+  }
   if (type === 'data') {
     const decoded = decodeLogChunk(logChunkRemainders.get(serverName) || '', stripTerminalControl(data));
     logChunkRemainders.set(serverName, decoded.remainder);
     const entries = decoded.lines
-      .filter(text => !isRoutineHealthLog(serverName, config?.[serverName], text))
-      .map(text => ({ server: serverName, text, observedAt, type: 'log' }));
+      .map(text => ({ server: serverName, text, observedAt, type: 'log', source: logSourceTracker.classify(serverName, text) }))
+      .filter(entry => !isRoutineHealthLog(serverName, config?.[serverName], entry.text));
     addMergedLogEntries(entries, { persist: !persisted });
   } else if (type === 'status') {
     if (status === 'stopped') {
       const remainder = logChunkRemainders.get(serverName) || '';
       if (remainder && !isRoutineHealthLog(serverName, config?.[serverName], remainder)) {
-        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log' }]);
+        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log', source: logSourceTracker.classify(serverName, remainder) }]);
       }
       logChunkRemainders.delete(serverName);
+      logSourceTracker.reset(serverName);
       state.lifecycle = 'stopped';
       state.connection = 'stopped';
     } else if (status === 'connected') {
+      errorDialog.resolve(`log-stream:${serverName}`);
       if (state.connection === 'failed') {
         addMergedLogEntries([{ server: serverName, text: 'Log connection recovered.', observedAt, type: 'system' }]);
       }
@@ -259,6 +289,7 @@ function handleServerLogStream({ serverName, type, data = '', status, error = ''
       state.connection = 'connected';
       state.error = '';
     } else if (status === 'failed') {
+      errorDialog.reportOnce(`log-stream:${serverName}`, serverName, error || 'Log connection failed.');
       if (state.connection !== 'failed' || state.error !== error) {
         addMergedLogEntries([{ server: serverName, text: `Log connection failed: ${error}`, observedAt, type: 'system' }]);
       }
@@ -333,11 +364,11 @@ async function joinServer(serverName) {
       terminal.writeln(`Connected to ${serverName}`);
     } else {
       log.error(`Failed to join server ${serverName}: ${result.error || 'Unknown error'}`);
-      alert(`Failed to join server ${serverName}`);
+      errorDialog.report(serverName, result.error || 'Unknown error');
     }
   } catch (error) {
     log.error(`Error joining server ${serverName}:`, error.message);
-    alert(`Error joining server ${serverName}: ${error.message}`);
+    errorDialog.report(serverName, error);
   }
 }
 
@@ -418,7 +449,7 @@ async function loadAflConfig() {
   const result = await ipcRenderer.invoke('get-afl-config', selectedAflHost);
   if (!result.success) {
     log.error(`Failed to load AFL config from ${selectedAflHost}:`, result.error);
-    alert(`Failed to load config: ${result.error}`);
+    for (const server of inferErrorServers(selectedAflHost, config)) errorDialog.report(server, result.error);
     return;
   }
   aflConfig = result.data || {};
@@ -457,7 +488,7 @@ async function saveAflConfig() {
   } else {
     const errMsg = res && res.error ? res.error : 'unknown error';
     log.error(`Failed to save AFL config:`, errMsg);
-    alert(`Failed to save settings: ${errMsg}`);
+    for (const server of inferErrorServers(selectedAflHost, config)) errorDialog.report(server, errMsg);
   }
   await loadAflConfig();
 }
@@ -495,18 +526,19 @@ async function fetchQueueState(serverName) {
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
-  if (serverConfig.server_type === 'tiled') {
-    const result = await ipcRenderer.invoke('tiled-ping', serverName);
-    return {
-      ok: !!result?.ok,
-      state: result?.state || null,
-      url: result?.url || url,
-      reason: result?.reason || null
-    };
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 500);
+  let timer;
   try {
+    if (serverConfig.server_type === 'tiled') {
+      const result = await ipcRenderer.invoke('tiled-ping', serverName);
+      return {
+        ok: !!result?.ok,
+        state: result?.state || null,
+        url: result?.url || url,
+        reason: result?.reason || null
+      };
+    }
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), 500);
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
       const reason = `HTTP ${response.status} from ${url}`;
@@ -569,12 +601,25 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
     !screenResult.sshDown &&
     !screenResult.authenticationRequired;
   const serverStatus = serverActivityPresentation(queueResult);
+  if (startedServers.has(serverName)) {
+    if (queueResult?.ok) {
+      queueHealthWarnings.delete(serverName);
+    } else if (queueResult?.reason && queueHealthWarnings.get(serverName) !== queueResult.reason) {
+      queueHealthWarnings.set(serverName, queueResult.reason);
+      log.warn(`${serverName}: Queue state unavailable: ${queueResult.reason}`);
+    }
+    if (screenResult.error) {
+      errorDialog.reportOnce(`ssh:${serverName}`, serverName, screenResult.error);
+    } else if (sshConnected) {
+      errorDialog.resolve(`ssh:${serverName}`);
+    }
+  }
   
   if (screenStatusElement) {
     screenStatusElement.textContent = sshConnected ? 'SSH UP' : 'SSH DOWN';
     screenStatusElement.className = `status-indicator ${sshConnected ? 'status-up' : 'status-down'}`;
     if (screenResult.authenticationRequired) {
-      screenStatusElement.title = 'Click Start and enter the NAS SSH password to enable management and status checks.';
+      screenStatusElement.title = 'Click Start and enter the SSH password to enable management and status checks.';
     } else if (screenResult.managementType === 'docker_compose') {
       screenStatusElement.title = screenResult.status
         ? 'SSH is connected and the configured Docker Compose service is running.'
@@ -612,6 +657,7 @@ function logServerStatusChange(serverName, sshConnected, serverState) {
 }
 
 function showServerDownStatus(serverName, disconnected = false) {
+  queueHealthWarnings.delete(serverName);
   const screenStatusElement = document.getElementById(`${serverName}-screen-status`);
   const httpStatusElement = document.getElementById(`${serverName}-http-status`);
   if (screenStatusElement) {
@@ -638,29 +684,35 @@ async function batchUpdateServerStatuses() {
     // Get servers grouped by host, keeping only servers started by this
     // Andon session. This avoids probing launchers that have not been started.
     const allByHost   = await ipcRenderer.invoke('get-servers-by-host');
-    const startedByHost = {};
+    const startedGroups = new Map();
 
     const externalServers = [...startedServers].filter(name => config[name]?.external_service);
     await Promise.all(externalServers.map(name => updateServerStatus(name)));
 
     for (const [host, names] of Object.entries(allByHost)) {
-      const startedNames = names.filter(name => startedServers.has(name));
-      if (startedNames.length) startedByHost[host] = startedNames;
+      for (const name of names) {
+        const server = config[name];
+        if (!startedServers.has(name) || !server) continue;
+        const groupId = `${getSshCredentialId(server)}:${getSshAuthentication(server)}`;
+        if (!startedGroups.has(groupId)) startedGroups.set(groupId, { host, servers: [] });
+        startedGroups.get(groupId).servers.push(name);
+      }
     }
-    if (Object.keys(startedByHost).length === 0) return;
+    if (startedGroups.size === 0) return;
 
     await Promise.all(
-      Object.entries(startedByHost).map(async ([host, servers]) => {
+      [...startedGroups.values()].map(async ({ host, servers }) => {
         const batchResult = await ipcRenderer.invoke(
           'get-batch-server-status',
-          host
+          host,
+          servers[0]
         );
 
         if (!batchResult.success) {
-          // If SSH is down for this host, update all servers on this host
-          log.debug(`SSH down for host ${host}, marking all servers as down`);
+          // Authentication and Screen sessions belong to an SSH account.
+          log.debug(`SSH check failed for ${servers[0]}, marking its group as down`);
           servers.forEach(serverName => {
-            updateServerStatusUI(serverName, { sshDown: true }, false);
+            updateServerStatusUI(serverName, batchResult, false);
           });
           return;
         }
@@ -690,8 +742,7 @@ async function batchUpdateServerStatuses() {
             try {
               queueResult = await fetchQueueState(serverName);
             } catch (err) {
-              log.error(`Error fetching queue state for ${serverName}:`, err.message);
-              queueResult = { ok: false, state: null };
+              queueResult = { ok: false, state: null, reason: err.message || 'Queue state check failed.' };
             }
 
             // Update the UI
@@ -713,17 +764,27 @@ async function controlServer(serverName, action) {
     config?.[serverName]?.tiled_management?.type === 'docker_compose';
   const wasStarted = startedServers.has(serverName);
   try {
-    if (!disconnectOnly && !await ensureSshPassword(serverName, action === 'start' || action === 'restart')) return;
+    const forcePasswordPrompt = config?.[serverName]?.tiled_management?.type === 'docker_compose' &&
+      (action === 'start' || action === 'restart');
+    if (!disconnectOnly && !await ensureSshPassword(serverName, forcePasswordPrompt)) return;
     if (action === 'stop') {
       startedServers.delete(serverName);
     }
     showServerDownStatus(serverName, disconnectOnly);
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
+    if (!result.success) {
+      errorDialog.report(serverName, result.error || result.warning ||
+        (result.sshDown ? 'SSH connection failed.' : 'Unknown error'));
+      if (result.output) errorDialog.report(serverName, result.output);
+    }
     if (result.success) {
-      log.info(`${action} successful for ${serverName}`);
+      if (result.degraded || result.warning) {
+        log.warn(`${action} completed with a warning for ${serverName}: ${result.warning || 'Server is in a degraded state.'}`);
+      } else {
+        log.info(`${action} successful for ${serverName}`);
+      }
     } else if (result.authenticationRequired) {
       log.warn(`SSH authentication is required for ${serverName}`);
-      alert(`SSH authentication failed for ${serverName}. Click Start and enter the password again.`);
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
     } else {
@@ -782,6 +843,7 @@ async function controlServer(serverName, action) {
       }
     }
   } catch (error) {
+    errorDialog.report(serverName, error);
     log.error(`Error during ${action} for ${serverName}:`, error.message);
     if (action === 'stop') {
       if (wasStarted) {
@@ -813,16 +875,17 @@ async function viewServerLog(serverName) {
       // Scroll to the bottom
       logContent.scrollTop = logContent.scrollHeight;
     } else if (result.authenticationRequired) {
-      alert(`SSH authentication is required for ${serverName}.`);
+      errorDialog.report(serverName, result.error || 'SSH authentication is required.');
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
-      alert(`Unable to get log: SSH is down for ${serverName}`);
+      errorDialog.report(serverName, result.error || 'SSH connection failed.');
     } else {
-      log.error(`Failed to get log for ${serverName}`);
-      alert(`Failed to get log for ${serverName}`);
+      log.error(`Failed to get log for ${serverName}:`, result.error || 'Unknown error');
+      errorDialog.report(serverName, result.error || 'Unknown error');
     }
   } catch (error) {
     log.error(`Error getting log for ${serverName}:`, error.message);
+    errorDialog.report(serverName, error);
   }
 }
 
@@ -1106,12 +1169,14 @@ function openServerModal(serverName = null) {
     form.elements['server-name'].value = serverName;
     form.elements['server-host'].value = server.host;
     form.elements['server-username'].value = server.username;
+    form.elements['server-ssh-authentication'].value = getSshAuthentication(server);
     form.elements['server-http-port'].value = server.httpPort;
     form.elements['server-screen-name'].value = server.screen_name;
     form.elements['server-type'].value = server.server_type === 'tiled'
       ? 'tiled'
-      : (server.server_script ? 'script' : 'module');
-    form.elements['server-script'].value = server.server_script || '';
+      : (server.script_file_location || server.server_script ? 'script' : 'module');
+    form.elements['server-script'].value = server.script_file_location || server.server_script || '';
+    form.elements['server-script'].dataset.localFile = server.script_file_location || '';
     form.elements['server-module'].value = server.server_module || '';
     form.elements['server-config-file-location'].value = server.config_file_location || '';
     form.elements['server-shell'].value = server.shell || 'bash';
@@ -1128,17 +1193,18 @@ function openServerModal(serverName = null) {
     form.reset();
     form.elements['server-name'].disabled = false;
     form.elements['server-type'].value = 'script';
+    form.elements['server-ssh-authentication'].value = 'key';
     form.elements['server-shell'].value = 'bash';
     form.elements['server-device'].checked = false;
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
     form.elements['server-config-file-location'].value = '';
+    form.elements['server-script'].dataset.localFile = '';
     form.elements['server-active'].checked = true;
     form.elements['server-env-type'].value = 'conda';
   }
 
   updateServerTypeFields();
-  updateConfigLocationOptions();
   updateEnvTypeFields();
   modal.style.display = 'block';
 }
@@ -1150,7 +1216,7 @@ function updateConfigLocationOptions() {
   const currentPath = configInput.value;
 
   const { enabled, files } = configLocationOptions;
-  group.style.display = enabled ? 'block' : 'none';
+  group.style.display = enabled && document.getElementById('server-type').value !== 'script' ? 'block' : 'none';
   select.replaceChildren();
   select.appendChild(new Option('Direct path', ''));
   for (const configPath of files) {
@@ -1170,12 +1236,27 @@ function updateServerTypeFields() {
   document.getElementById('module-group').style.display = serverType === 'module' ? 'block' : 'none';
   const configInput = document.getElementById('server-config-file-location');
   const isTiled = serverType === 'tiled';
+  document.getElementById('config-file-group').style.display = serverType === 'script' ? 'none' : 'block';
+  document.getElementById('ssh-authentication-group').style.display = 'block';
   configInput.required = isTiled;
   configInput.placeholder = isTiled ? '/path/to/tiled_config.yml' : '/path/to/server-config.json';
   document.getElementById('server-shell').closest('.form-group').style.display = isTiled ? 'none' : 'block';
   document.getElementById('server-env-type').closest('.form-group').style.display = 'block';
   document.getElementById('conda-group').style.display = document.getElementById('server-env-type').value === 'conda' ? 'block' : 'none';
   document.getElementById('virtualenv-group').style.display = document.getElementById('server-env-type').value === 'pip' ? 'block' : 'none';
+  updateConfigLocationOptions();
+}
+
+async function browseServerScript() {
+  const result = await ipcRenderer.invoke('show-open-dialog', {
+    title: 'Select server launcher script',
+    properties: ['openFile'],
+    filters: [{ name: 'Shell scripts', extensions: ['sh', 'bash'] }, { name: 'All files', extensions: ['*'] }]
+  });
+  if (result.canceled || !result.filePaths?.length) return;
+  const input = document.getElementById('server-script');
+  input.value = result.filePaths[0];
+  input.dataset.localFile = input.value;
 }
 
 function updateEnvTypeFields() {
@@ -1196,6 +1277,7 @@ async function handleServerFormSubmit(event) {
     httpPort: parseInt(form.elements['server-http-port'].value, 10),
     screen_name: form.elements['server-screen-name'].value,
     shell: form.elements['server-shell'].value,
+    ssh_authentication: form.elements['server-ssh-authentication'].value,
     active: form.elements['server-active'].checked,
     device: form.elements['server-device'].checked
   };
@@ -1203,15 +1285,30 @@ async function handleServerFormSubmit(event) {
   const serverType = form.elements['server-type'].value;
   if (serverType === 'tiled') {
     serverConfig.server_type = 'tiled';
+    serverConfig.server_module = '';
+    serverConfig.server_script = '';
+    serverConfig.script_file_location = '';
     serverConfig.shell = 'bash';
   } else if (serverType === 'script') {
-    serverConfig.server_script = form.elements['server-script'].value;
+    serverConfig.server_type = 'script';
+    serverConfig.server_module = '';
+    const input = form.elements['server-script'];
+    const script = input.value.trim();
+    let localFile = input.dataset.localFile === script;
+    if (!localFile) {
+      try { localFile = fs.statSync(script).isFile(); } catch (_) { /* Existing server-side commands remain supported. */ }
+    }
+    serverConfig.server_script = localFile ? '' : script;
+    serverConfig.script_file_location = localFile ? script : '';
   } else {
+    serverConfig.server_type = 'module';
+    serverConfig.server_script = '';
+    serverConfig.script_file_location = '';
     serverConfig.server_module = form.elements['server-module'].value;
   }
 
   // Keep an empty value so an edit can explicitly clear a prior selection.
-  serverConfig.config_file_location = form.elements['server-config-file-location'].value.trim();
+  serverConfig.config_file_location = serverType === 'script' ? '' : form.elements['server-config-file-location'].value.trim();
 
   const envType = form.elements['server-env-type'].value;
   serverConfig.env_type = envType;
@@ -1258,7 +1355,6 @@ async function addServer(serverName, serverConfig) {
   await ipcRenderer.invoke('add-server', { serverName, serverConfig });
   await loadConfig();
   renderServers();
-  ipcRenderer.on('server-log-stream', (_event, payload) => receiveServerLogEvent(payload));
 }
 
  async function updateServer(serverName, serverConfig) {
@@ -1361,13 +1457,13 @@ async function importConfig() {
       alert(result.message);
       await loadConfig();
       renderServers();
-    } else {
+    } else if (!result.canceled) {
       log.warn('Configuration import failed:', result.message || result.error);
-      alert(result.message || result.error);
+      errorDialog.report('Andon', result.error || result.message);
     }
   } catch (error) {
     log.error('Error importing config:', error.message);
-    alert('Failed to import config file.');
+    errorDialog.report('Andon', error);
   }
 }
 
@@ -1378,13 +1474,13 @@ async function importSSHKey() {
     if (result.success) {
       log.info('SSH key imported successfully');
       alert(result.message);
-    } else {
+    } else if (!result.canceled) {
       log.warn('SSH key import failed:', result.message || result.error);
-      alert(result.message || result.error);
+      errorDialog.report('Andon', result.error || result.message);
     }
   } catch (error) {
     log.error('Error importing SSH key:', error.message);
-    alert('Failed to import SSH key.');
+    errorDialog.report('Andon', error);
   }
 }
 
@@ -1419,7 +1515,7 @@ async function saveConfig() {
     alert('Configuration saved successfully');
   } else {
     log.error('Failed to save configuration:', result.error);
-    alert('Failed to save configuration: ' + result.error);
+    errorDialog.report('Andon', result.error);
   }
 }
 
@@ -1438,7 +1534,9 @@ async function setSshKeyPath() {
 
 // Wait for the DOM to be fully loaded before creating UI elements
 document.addEventListener('DOMContentLoaded', async () => {
+  errorDialog.initialize();
   log.info('DOM content loaded, initializing UI');
+  await syncSessionLogEvents();
   
   await loadPaths();  // Load paths first
   await loadConfig();
@@ -1451,11 +1549,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Set up event listeners
   document.getElementById('add-server-btn').addEventListener('click', () => openServerModal());
-  document.querySelector('.modal .close').addEventListener('click', closeServerModal);
+  document.querySelector('#server-modal .close').addEventListener('click', closeServerModal);
   document.getElementById('server-form').addEventListener('submit', handleServerFormSubmit);
   // document.getElementById('import-config-btn').addEventListener('click', importConfig);
   // document.getElementById('import-ssh-key-btn').addEventListener('click', importSSHKey);
   document.getElementById('server-type').addEventListener('change', updateServerTypeFields);
+  document.getElementById('browse-server-script').addEventListener('click', browseServerScript);
   document.getElementById('server-env-type').addEventListener('change', updateEnvTypeFields);
   document.getElementById('set-config-path-btn').addEventListener('click', setConfigPath);
   document.getElementById('save-config-btn').addEventListener('click', saveConfig);
@@ -1486,6 +1585,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('ssh-password-cancel').addEventListener('click', () => finishSshPasswordPrompt());
 
   document.getElementById('all-logs-search').addEventListener('input', renderAllLogs);
+  for (const source of ['APIServer', 'QueueDaemon']) {
+    const checkbox = document.getElementById(`all-logs-${source.toLowerCase()}`);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) hiddenLogSources.delete(source);
+      else hiddenLogSources.add(source);
+      renderAllLogs();
+    });
+  }
   document.getElementById('all-logs-pause').addEventListener('click', () => {
     allLogsPaused = !allLogsPaused;
     document.getElementById('all-logs-pause').textContent = allLogsPaused ? 'Resume' : 'Pause';
